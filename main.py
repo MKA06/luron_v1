@@ -24,6 +24,10 @@ async def weather():
 
 SYSTEM_MESSAGE = (
     """ROL
+  Hızlı konuş
+  birisi randevu almak isterse, önce kullanıcıının tc kimlik numarasını sor, sonra randevu konusuna aktar.s
+
+
 İrmet Hospital (Çerkezköy, Tekirdağ) sanal karşılama ve çağrı yönlendirme asistanısın. Amacın; arayanları güler yüzlü ve profesyonel bir dille karşılamak, doğru birime/uzmana yönlendirmek, randevu/teklif sürecini başlatmak, uluslararası hastalara destek sağlamak ve iletişim bilgilerini eksiksiz toplamaktır. Türkçe başla fakat gerekirse İngilizce, Azerbaycan dili, ya da başka herhangi bir yabancı dilde de konuşabilirsin eğer konuştuğun kişi farklı bir dilde konuşuyorsa (kısacası konuştuğun kişinin dilinde konuş).
 
 KİMLİK & TON
@@ -51,7 +55,7 @@ AKREDİTASYON/ÖDÜLLER (soru gelirse tek cümleyle)
 
 BÖLÜMLER (özetle say ve yönlendir)
 Aşağıdaki başlıklara kısaca bilgi ver ve randevu/iletme yap:
-- Obezite ve Bariatrik Cerrahi, Genel Cerrahi, Estetik/Plastik-Rekonstrüktif Cerrahi, Diş Tedavileri
+- Obezite ve Ba riatrik Cerrahi, Genel Cerrahi, Estetik/Plastik-Rekonstrüktif Cerrahi, Diş Tedavileri
 - Kardiyoloji/Kalp Damar Cerrahisi
 - Ortopedi ve Travmatoloji, Nöroloji, Beyin ve Sinir Cerrahisi
 - Göz Hastalıkları, KBB, Dermatoloji
@@ -106,6 +110,7 @@ YÖNLENDİRME & ESCALATION
 GÜVENLİK & GİZLİLİK
 - Gereksiz sağlık verisi alma. Sadece randevu ve ön değerlendirme için minimum bilgi.
 - KVKK metinlerine yönlendir; paylaşım izinlerini sor ve kaydet.
+
 """
 )
 
@@ -152,7 +157,7 @@ async def handle_incoming_call(request: Request):
     #     language="tr-TR"
     # )
     response.say(
-        "O.K. you can start talking!",
+        "İrmed Hospital'a hoş geldiniz!",
         voice="Polly.Filiz"
     )
     host = request.url.hostname
@@ -169,7 +174,7 @@ async def handle_media_stream(websocket: WebSocket):
     async with websockets.connect(
         # f"wss://api.openai.com/v1/realtime?model=gpt-realtime&temperature={TEMPERATURE}",
         f"wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview&temperature={TEMPERATURE}",
-        extra_headers={
+    additional_headers={
             "Authorization": f"Bearer {OPENAI_API_KEY}"
         }
     ) as openai_ws:
