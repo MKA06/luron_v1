@@ -52,11 +52,13 @@ try:
 except Exception:
     pass
 
+
 async def get_weather():
     print("started")
     await asyncio.sleep(10)
     print("HEY HEY HEY WHAT'S HAPPENING YOUTUBE")
     return "The weather right now is sunny"
+
 
 @app.get("/", response_class=JSONResponse)
 async def index_page():
@@ -417,7 +419,7 @@ async def handle_media_stream_with_agent(websocket: WebSocket, agent_id: str):
                             {"role": "user", "content": transcript_text or ""},
                         ],
                         temperature=0.0,
-                        max_tokens=10,
+                        max_tokens=4,
                     )
                     disposition_text = (disp_msg.choices[0].message.content or "").strip().lower()
                     if disposition_text not in ("success", "failed"):
@@ -492,6 +494,42 @@ async def send_session_update(openai_ws, instructions):
     await openai_ws.send(json.dumps(session_update))
 
 
+async def transcribe_and_print_call(ulaw_bytes: bytes) -> None:
+    """Convert u-law bytes to WAV, send to OpenAI STT, and print transcript."""
+    if not ulaw_bytes:
+        print("No audio captured; nothing to transcribe.")
+        return
+    try:
+        # Convert 8kHz u-law to 16-bit PCM
+        pcm16 = audioop.ulaw2lin(ulaw_bytes, 2)
+        wav_buffer = io.BytesIO()
+        with wave.open(wav_buffer, 'wb') as wav_file:
+            wav_file.setnchannels(1)
+            wav_file.setsampwidth(2)
+            wav_file.setframerate(8000)
+            wav_file.writeframes(pcm16)
+        wav_buffer.seek(0)
+        # Give the buffer a name so the SDK sets filename in multipart form
+        setattr(wav_buffer, 'name', 'call.wav')
+    except Exception as e:
+        print(f"Failed to prepare audio for transcription: {e}")
+        return
+
+    try:
+        result = openai_client.audio.transcriptions.create(
+            model="whisper-1",
+            file=wav_buffer,
+        )
+        text = getattr(result, 'text', None) or (result.get('text') if isinstance(result, dict) else None)
+        if text:
+            print("===== CALL TRANSCRIPT =====")
+            print(text)
+            print("===========================")
+        else:
+            print("Transcription completed but no text returned.")
+    except Exception as e:
+        print(f"Transcription failed: {e}")
+
 
 async def transcribe_ulaw_to_text(ulaw_bytes: bytes) -> str:
     if not ulaw_bytes:
@@ -517,6 +555,33 @@ async def transcribe_ulaw_to_text(ulaw_bytes: bytes) -> str:
         return ""
 
 
+def _format_duration(seconds: float) -> str:
+    total = int(round(seconds))
+    hours, rem = divmod(total, 3600)
+    minutes, secs = divmod(rem, 60)
+    if hours:
+        return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+    return f"{minutes:02d}:{secs:02d}"
+
+
+async def print_conversation_transcript(conversation: list[dict], *, duration_seconds: Optional[float] = None) -> None:
+    print("CALL TRANSCRIPT")
+    if duration_seconds is not None:
+        print(f"Duration: {_format_duration(duration_seconds)}")
+    for item in conversation:
+        role = item.get("role")
+        if role == "assistant":
+            text = item.get("text") or ""
+            if text:
+                print(f"Assistant: {text}")
+        elif role == "user":
+            # Transcribe if needed
+            if "text" not in item:
+                text = await transcribe_ulaw_to_text(item.get("audio_bytes", b""))
+                item["text"] = text
+            text = item.get("text") or ""
+            if text:
+                print(f"User: {text}")
 
 if __name__ == "__main__":
     import uvicorn
