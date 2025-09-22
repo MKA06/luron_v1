@@ -3,13 +3,13 @@ import io
 import wave
 import time
 import math
-import audioop
 from typing import Any, Dict, Optional, List
 
 from dotenv import load_dotenv
 from supabase import create_client, Client
 from openai import OpenAI
 import stripe
+from compat_audioop import ulaw2lin
 
 
 load_dotenv()
@@ -35,7 +35,7 @@ async def transcribe_ulaw_to_text(ulaw_bytes: bytes) -> str:
     if not ulaw_bytes:
         return ""
     try:
-        pcm16 = audioop.ulaw2lin(ulaw_bytes, 2)
+        pcm16 = ulaw2lin(ulaw_bytes, 2)
         wav_buffer = io.BytesIO()
         with wave.open(wav_buffer, 'wb') as wav_file:
             wav_file.setnchannels(1)

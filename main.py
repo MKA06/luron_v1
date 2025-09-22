@@ -4,7 +4,6 @@ import base64
 import asyncio
 import websockets
 import contextlib
-import audioop
 import wave
 import io
 import time
