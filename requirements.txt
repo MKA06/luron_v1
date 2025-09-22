@@ -6,3 +6,4 @@ supabase==2.15.0
 openai==1.76.0
 python-dotenv==1.0.1
 python-multipart==0.0.20
+stripe==6.6.0

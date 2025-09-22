@@ -4,37 +4,115 @@ import base64
 import asyncio
 import websockets
 import contextlib
-import audioop
-import wave
-import io
-import time
 from typing import Any, Dict, Optional
-from fastapi import FastAPI, WebSocket, Request, UploadFile, File, Form
+from fastapi import FastAPI, WebSocket, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.websockets import WebSocketDisconnect
 from twilio.twiml.voice_response import VoiceResponse, Connect, Say, Stream
 from dotenv import load_dotenv
-from supabase import create_client, Client
-from openai import OpenAI
-from post_call import process_post_call
-
 load_dotenv()
 # Configuration
 OPENAI_API_KEY = os.getenv('OPENAI_API_KEY') # requires OpenAI Realtime API Access
 PORT = int(os.getenv('PORT', 8000))
 VOICE = 'shimmer'
-openai_client = OpenAI()
-
-# Supabase configuration
-SUPABASE_URL = os.getenv('SUPABASE_URL')
-SUPABASE_KEY = os.getenv('SUPABASE_KEY')
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 async def weather():
     # Legacy stub; unused. Keeping for backward-compatibility.
     await asyncio.sleep(10)
     return "the weather is sunny"
 
+
+SYSTEM_MESSAGE = (
+    """ROL
+  Hızlı konuş
+  birisi randevu almak isterse, önce kullanıcıının tc kimlik numarasını sor, sonra randevu konusuna aktar.s
+
+
+İrmet Hospital (Çerkezköy, Tekirdağ) sanal karşılama ve çağrı yönlendirme asistanısın. Amacın; arayanları güler yüzlü ve profesyonel bir dille karşılamak, doğru birime/uzmana yönlendirmek, randevu/teklif sürecini başlatmak, uluslararası hastalara destek sağlamak ve iletişim bilgilerini eksiksiz toplamaktır. Türkçe başla fakat gerekirse İngilizce, Azerbaycan dili, ya da başka herhangi bir yabancı dilde de konuşabilirsin eğer konuştuğun kişi farklı bir dilde konuşuyorsa (kısacası konuştuğun kişinin dilinde konuş).
+
+KİMLİK & TON
+- Doğal, kısa ve net konuş: 1–2 cümle + gerekiyorsa çok kısa maddeler. Hızlı konuş
+- Empatik, sakin, güven veren; tıbbi tavsiye verme, teşhis/tedavi önermeden bilgilendir.
+- Acil durum tespiti: "Acil bir durumsa lütfen 112’yi arayın."
+
+KURUM BİLGİLERİ (Sabit kullan)
+- Adres: G.O.P. Mah. Namık Kemal Bulv. No:17/21 Çerkezköy / Tekirdağ
+- Santral/Çağrı Merkezi: +90 282 725 44 44
+- E-posta: info@irmethospital.com (genel), patient@irmethospital.com (uluslararası)
+- WhatsApp danışma (uluslararası): +90 530 955 38 88
+- Web aksiyonları: "Get a Free Quote" (ücretsiz ön teklif), "Online Randevu"
+- Muayene ücret bilgisi: Çağrı Merkezi verir.
+- KVKK ve Hasta Hakları: Kişisel verileri asgari düzeyde al, güvenli aktar; ayrıntılı talepleri ilgili birime yönlendir.
+
+ALT YAPI & KAPASİTE (Bilgilendirme amaçlı, soru gelirse kısa söyle)
+- 18.000 m² hastane, toplam ~200 yatak; 24 yetişkin, 24 yenidoğan, 5 koroner, 5 KVC yoğun bakım.
+- 8 ameliyathane; Anjiyo, KVC ve Nükleer Tıp üniteleri.
+- Görüntüleme: MR, 128 dilimli BT, dijital röntgen/mamografi, 4D USG.
+- Uluslararası sağlık turizmi: 2012’den beri; çok dilli ekip ve VIP transfer.
+
+AKREDİTASYON/ÖDÜLLER (soru gelirse tek cümleyle)
+- SRC (Surgical Review Corporation) "Center of Excellence" ve AACI akreditasyonları.
+
+BÖLÜMLER (özetle say ve yönlendir)
+Aşağıdaki başlıklara kısaca bilgi ver ve randevu/iletme yap:
+- Obezite ve Ba riatrik Cerrahi, Genel Cerrahi, Estetik/Plastik-Rekonstrüktif Cerrahi, Diş Tedavileri
+- Kardiyoloji/Kalp Damar Cerrahisi
+- Ortopedi ve Travmatoloji, Nöroloji, Beyin ve Sinir Cerrahisi
+- Göz Hastalıkları, KBB, Dermatoloji
+- Dahiliye, Gastroenteroloji, Enfeksiyon, Radyoloji, Girişimsel Radyoloji, Biyokimya
+- Kadın Doğum, Yenidoğan, Çocuk Sağlığı ve Hastalıkları, Çocuk Cerrahisi
+- Fizik Tedavi ve Rehabilitasyon, Psikiyatri, Psikoloji, Beslenme ve Diyet
+
+CHECK-UP (sorulursa kısa bilgi)
+- Yaşa ve cinsiyete göre paketli "periodik sağlık taraması"; içerik ve ücret için çağrı merkezi/randevu.
+
+ULUSLARARASI HASTA AKIŞI
+- Diller: Türkçe, İngilizce, Arapça, Bulgarca, Arnavutça, İtalyanca, Kürtçe (diğer diller için ön bildirim).
+- Süreç (özetle): Hasta koordinatörü atanır → ön değerlendirme/teklif → uçuş sonrası 7/24 VIP havaalanı transferi → danışman eşliğinde yatış/işlemler.
+- Evraklar: Kısa öykü, önceki tetkikler (rapor, görüntülemeler), düzenli ilaçlar.
+- İletişim: patient@irmethospital.com veya WhatsApp +90 530 955 38 88.
+
+VERİ TOPLAMA (her aramada gerekliyse sırayla iste)
+- Ad Soyad, telefon, e-posta
+- Yaş/Doğum yılı (gerekirse)
+- Şikâyet/İhtiyaç: (örn. bariatrik cerrahi, estetik, diş, kardiyoloji vb.)
+- Tercih edilen tarih/saat, doktor/bölüm tercihi
+- Uluslararası çağrıda: uyruğu/ülke, geliş planı (tahmini tarih)
+- İzinli iletişim kanalı (SMS/e-posta) ve KVKK onayı metnine yönlendirme
+
+ANA AKIŞ
+1) Karşılama:
+"İrmet Hospital'a hoş geldiniz, nasıl yardımcı olabilirim?"
+2) Triage:
+- "Randevu mu oluşturmak istersiniz yoksa bilgi mi almak istiyorsunuz?"
+- "Hangi bölüm veya işlem için aramıştınız?"
+3) Randevu/Ön-Teklif:
+- Türkiye içi: "Uygun gün/saat paylaşabilir misiniz? Ücret bilgisini çağrı merkezimiz netleştirir."
+- Uluslararası: "Size bir hasta koordinatörü atayalım. Kısa tıbbi öykünüz ve mevcut raporlarınızla ön teklif hazırlayalım."
+4) Onay & Özet:
+- "Özetliyorum: [Bölüm/İşlem], [tarih/saat/tercih], iletişim: [telefon/e-posta]."
+- "Detayları SMS/e-posta ile paylaşacağım."
+5) Kapatma:
+"Aramanız için teşekkür ederiz. Acil durumlar için lütfen 112’yi arayın. İyi günler dilerim."
+
+KISA YANIT STİLİ (örnek kalıplar)
+- "Randevu için ad-soyad ve tercih ettiğiniz tarihi alabilirim."
+- "Uluslararası süreçte size hasta koordinatörü atıyoruz; WhatsApp +90 530 955 38 88 üzerinden de yazabilirsiniz."
+- "Muayene ücret bilgisi çağrı merkezimizden paylaşılır."
+- "Tıbbi tavsiye veremem; ilgili uzmanımıza randevu oluşturalım."
+
+YÖNLENDİRME & ESCALATION
+- Spesifik hekim/birim talebi → ilgili poliklinik sekreterliği.
+- Tıbbi sonuç/ilaç/kompleks vaka → hekim/hasta koordinatörü.
+- Veri erişim/silme talepleri → KVKK birimi ve resmi başvuru kanalı.
+- Şikâyet/öneri → Hasta Hakları birimi.
+
+GÜVENLİK & GİZLİLİK
+- Gereksiz sağlık verisi alma. Sadece randevu ve ön değerlendirme için minimum bilgi.
+- KVKK metinlerine yönlendir; paylaşım izinlerini sor ve kaydet.
+
+"""
+)
 
 TEMPERATURE = float(os.getenv('TEMPERATURE', 0.8))
 LOG_EVENT_TYPES = [
@@ -53,104 +131,55 @@ try:
 except Exception:
     pass
 
+
 async def get_weather():
     print("started")
     await asyncio.sleep(10)
     print("HEY HEY HEY WHAT'S HAPPENING YOUTUBE")
     return "The weather right now is sunny"
 
+
 @app.get("/", response_class=JSONResponse)
 async def index_page():
     return {"message": "Twilio Media Stream Server is running!"}
-
-# Knowledge base webhook: summarize links+files and attach to agent prompt
-@app.post("/webhook/agents/{agent_id}/summarize", response_class=JSONResponse)
-async def webhook_agent_summarize(agent_id: str,
-                                  links: list[str] | None = Form(None),
-                                  url: str | None = Form(None),  # fallback single url
-                                  files: list[UploadFile] | None = File(None)):
-    try:
-        from kb import summarize_and_update_agent  # local import to avoid circular import issues
-        link_list = links or ([url] if url else None)
-        result = await summarize_and_update_agent(agent_id, link_list, files)
-        return JSONResponse(content={"ok": True, **result})
-    except Exception as e:
-        return JSONResponse(status_code=400, content={"ok": False, "error": str(e)})
-
-@app.api_route("/twilio/agents/{agent_id}", methods=["GET", "POST"])
-async def handle_agent_call(agent_id: str, request: Request):
-    """Handle incoming call for specific agent and return TwiML response to connect to Media Stream."""
-    print(f"handle_agent_call: Received agent_id: {agent_id}")
-
-    # Fetch agent data from Supabase
-    result = supabase.table('agents').select('prompt, welcome_message, user_id').eq('id', agent_id).single().execute()
-    agent_data = result.data
-    print(f"handle_agent_call: Fetched agent data: welcome_message={agent_data.get('welcome_message')[:50]}...")
-
-    # Store agent data for this call session
-    agent_prompt = agent_data.get('prompt')
-    agent_welcome = agent_data.get('welcome_message')
-    user_id = agent_data.get('user_id')
-
-    form = await request.form()
-    call_sid = form.get('CallSid')
-    from_number = form.get('From')
-    to_number = form.get('To')
-
-    payload = {
-        'agent_id': agent_id,
-        'user_id': user_id,
-        'call_status': 'in-progress',
-    }
-    payload['twilio_call_sid'] = call_sid
-    payload['from_number'] = from_number
-    payload['to_number'] = to_number
-    supabase.table('calls').insert(payload).execute()
-
+@app.api_route("/incoming-call", methods=["GET", "POST"])
+async def handle_incoming_call(request: Request):
+    """Handle incoming call and return TwiML response to connect to Media Stream."""
     response = VoiceResponse()
 
+    # response.say(
+    #     "O.K. you can start talking!",
+    #     voice="Google.en-US-Chirp3-HD-Aoede"
+    # )
+    # response.say(
+    #     "O.K. you can start talking!",
+    #     voice="alice",
+    #     language="tr-TR"
+    # )
+    response.say(
+        "İrmed Hospital'a hoş geldiniz!",
+        voice="Polly.Filiz"
+    )
     host = request.url.hostname
     connect = Connect()
-
-    stream_url = f'wss://{host}/media-stream/{agent_id}'
-    print(f"handle_agent_call: Stream URL: {stream_url}")
-    connect.stream(url=stream_url)
+    connect.stream(url=f'wss://{host}/media-stream')
     response.append(connect)
-
-    print(f"handle_agent_call: TwiML Response: {str(response)}")
     return HTMLResponse(content=str(response), media_type="application/xml")
 
-@app.websocket("/media-stream/{agent_id}")
-async def handle_media_stream_with_agent(websocket: WebSocket, agent_id: str):
-    """Handle WebSocket connections between Twilio and OpenAI for specific agent."""
-    print(f"Client connected with agent_id: {agent_id}")
+@app.websocket("/media-stream")
+async def handle_media_stream(websocket: WebSocket):
+    """Handle WebSocket connections between Twilio and OpenAI."""
+    print("Client connected")
     await websocket.accept()
-
-    # Fetch agent prompt and welcome message from Supabase
-    result = supabase.table('agents').select('prompt, welcome_message').eq('id', agent_id).single().execute()
-    agent_data = result.data
-    agent_prompt = agent_data.get('prompt')
-    agent_welcome = agent_data.get('welcome_message')
-    print(f"Using agent {agent_id} with custom prompt")
-
     async with websockets.connect(
-         f"wss://api.openai.com/v1/realtime?model=gpt-realtime&temperature={TEMPERATURE}",
+        # f"wss://api.openai.com/v1/realtime?model=gpt-realtime&temperature={TEMPERATURE}",
+        f"wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview&temperature={TEMPERATURE}",
     additional_headers={
             "Authorization": f"Bearer {OPENAI_API_KEY}"
         }
     ) as openai_ws:
         # Per-connection tool queue and worker
         tool_queue: "asyncio.Queue[Dict[str, Any]]" = asyncio.Queue()
-        # Buffer inbound Twilio audio (PCMU/u-law) for post-call transcription
-        ulaw_chunks: list[bytes] = []
-        # Conversation capture
-        conversation: list[dict] = []  # sequence of {role: 'user'|'assistant', text?: str, audio_bytes?: bytes}
-        is_user_speaking: bool = False
-        current_user_buffer: bytearray = bytearray()
-        call_started_monotonic: Optional[float] = None
-        call_ended_monotonic: Optional[float] = None
-        db_call_id: Optional[str] = None
-        twilio_call_sid: Optional[str] = None
 
         async def tool_worker():
             while True:
@@ -181,6 +210,7 @@ async def handle_media_stream_with_agent(websocket: WebSocket, agent_id: str):
                     }
                     await openai_ws.send(json.dumps(item_event))
 
+                    # Ask the model to respond using the new tool result
                     await openai_ws.send(json.dumps({"type": "response.create"}))
                 except Exception as e:
                     # On error, still inform the model so it can recover
@@ -202,11 +232,11 @@ async def handle_media_stream_with_agent(websocket: WebSocket, agent_id: str):
 
         worker_task = asyncio.create_task(tool_worker())
 
-        await send_session_update(openai_ws, agent_prompt)
+        await send_session_update(openai_ws)
         stream_sid = None
         async def receive_from_twilio():
             """Receive audio data from Twilio and send it to the OpenAI Realtime API."""
-            nonlocal stream_sid, is_user_speaking, current_user_buffer, call_started_monotonic, call_ended_monotonic, twilio_call_sid, db_call_id
+            nonlocal stream_sid
             try:
                 async for message in websocket.iter_text():
                     data = json.loads(message)
@@ -215,69 +245,17 @@ async def handle_media_stream_with_agent(websocket: WebSocket, agent_id: str):
                             "type": "input_audio_buffer.append",
                             "audio": data['media']['payload']
                         }
-                        # Decode and buffer raw u-law audio for transcription
-                        try:
-                            decoded = base64.b64decode(data['media']['payload'])
-                            ulaw_chunks.append(decoded)
-                            if is_user_speaking:
-                                current_user_buffer.extend(decoded)
-                        except Exception:
-                            pass
                         await openai_ws.send(json.dumps(audio_append))
                     elif data['event'] == 'start':
                         stream_sid = data['start']['streamSid']
                         print(f"Incoming stream has started {stream_sid}")
-                        # Capture CallSid and resolve DB call id for later update
-                        try:
-                            twilio_call_sid = data['start'].get('callSid')
-                            if twilio_call_sid:
-                                try:
-                                    lookup = supabase.table('calls').select('id').eq('twilio_call_sid', twilio_call_sid).eq('agent_id', agent_id).order('created_at', desc=True).limit(1).execute()
-                                    if lookup.data:
-                                        db_call_id = lookup.data[0].get('id')
-                                except Exception as e:
-                                    print(f"Failed to lookup call record: {e}")
-                        except Exception:
-                            pass
-                        if call_started_monotonic is None:
-                            call_started_monotonic = time.monotonic()
-                        # Trigger initial assistant welcome via OpenAI once stream is ready
-                        try:
-                            if agent_welcome:
-                                await openai_ws.send(json.dumps({
-                                    "type": "response.create",
-                                    "response": {
-                                        "instructions": f"Greet the user by saying exactly: {agent_welcome}"
-                                    }
-                                }))
-                        except Exception as e:
-                            print(f"Failed to send initial welcome: {e}")
-                    elif data['event'] == 'stop':
-                        # Twilio indicates call is ending; close OpenAI WS and exit loop
-                        print(f"Stream stopped {stream_sid}")
-                        # Finalize any in-progress user utterance
-                        if is_user_speaking and current_user_buffer:
-                            conversation.append({
-                                "role": "user",
-                                "audio_bytes": bytes(current_user_buffer)
-                            })
-                            current_user_buffer = bytearray()
-                            is_user_speaking = False
-                        call_ended_monotonic = time.monotonic()
-                        try:
-                            if openai_ws.state.name == 'OPEN':
-                                await openai_ws.close()
-                        except Exception:
-                            pass
-                        # Exit receive loop to allow gather to finish and trigger cleanup
-                        return
             except WebSocketDisconnect:
                 print("Client disconnected.")
                 if openai_ws.state.name == 'OPEN':
                     await openai_ws.close()
         async def send_to_twilio():
             """Receive events from the OpenAI Realtime API, send audio back to Twilio."""
-            nonlocal stream_sid, is_user_speaking, current_user_buffer
+            nonlocal stream_sid
             try:
                 async for openai_message in openai_ws:
                     response = json.loads(openai_message)
@@ -289,9 +267,6 @@ async def handle_media_stream_with_agent(websocket: WebSocket, agent_id: str):
                     # Handle barge-in when user starts speaking 
                     
                     if response['type'] == 'input_audio_buffer.speech_started':
-                        # Begin capturing a user utterance
-                        is_user_speaking = True
-                        current_user_buffer = bytearray()
                         # Clear Twilio's audio buffer
                         clear_message = {
                             "event": "clear",
@@ -303,15 +278,6 @@ async def handle_media_stream_with_agent(websocket: WebSocket, agent_id: str):
                             "type": "response.cancel"
                         }
                         await openai_ws.send(json.dumps(cancel_message)) 
-
-                    if response['type'] == 'input_audio_buffer.speech_stopped':
-                        # Finish capturing the current user utterance
-                        if is_user_speaking and current_user_buffer:
-                            conversation.append({
-                                "role": "user",
-                                "audio_bytes": bytes(current_user_buffer)
-                            })
-                        is_user_speaking = False
 
                     if response['type'] == 'response.output_audio.delta' and response.get('delta'):
                         # Audio from OpenAI
@@ -327,26 +293,10 @@ async def handle_media_stream_with_agent(websocket: WebSocket, agent_id: str):
                             await websocket.send_json(audio_delta)
                         except Exception as e:
                             print(f"Error processing audio data: {e}")
-                    # Detect function calling and queue tools; also capture assistant text
+                    # Detect function calling and queue tools
                     if response.get('type') == 'response.done':
                         try:
                             out = response.get('response', {}).get('output', [])
-                            # Extract assistant message text/transcript for transcript log
-                            extracted_texts: list[str] = []
-                            for item in out:
-                                if isinstance(item, dict) and item.get('type') == 'message':
-                                    for piece in (item.get('content', []) or []):
-                                        if not isinstance(piece, dict):
-                                            continue
-                                        if piece.get('type') == 'output_text' and 'text' in piece:
-                                            extracted_texts.append(piece['text'])
-                                        elif piece.get('type') == 'output_audio' and 'transcript' in piece:
-                                            extracted_texts.append(piece['transcript'])
-                            if extracted_texts:
-                                conversation.append({
-                                    "role": "assistant",
-                                    "text": " ".join(t for t in extracted_texts if t)
-                                })
                             for item in out:
                                 if item.get('type') == 'function_call':
                                     name = item.get('name')
@@ -386,27 +336,20 @@ async def handle_media_stream_with_agent(websocket: WebSocket, agent_id: str):
                 await tool_queue.put(None)
             except Exception:
                 pass
-            with contextlib.suppress(asyncio.CancelledError):
+            worker_task.cancel()
+            with contextlib.suppress(Exception):
                 await worker_task
-            # After call ends, assemble transcript and update DB
-            await process_post_call(
-                conversation=conversation,
-                agent_id=agent_id,
-                db_call_id=db_call_id,
-                twilio_call_sid=twilio_call_sid,
-                call_started_monotonic=call_started_monotonic,
-                call_ended_monotonic=call_ended_monotonic,
-            )
 
 
 
-async def send_session_update(openai_ws, instructions):
+async def send_session_update(openai_ws):
     """Send session update to OpenAI WebSocket."""
     session_update = {
         "type": "session.update",
         "session": {
             "type": "realtime",
-            "model": "gpt-realtime",
+            # "model": "gpt-realtime",
+            "model": "gpt-4o-realtime-preview",
             "output_modalities": ["audio"],
             "audio": {
                 "input": {
@@ -418,7 +361,7 @@ async def send_session_update(openai_ws, instructions):
                     "voice": VOICE
                 }
             },
-            "instructions": instructions,
+            "instructions": SYSTEM_MESSAGE,
             # Configure function calling tools at the session level
             "tools": [
                 {
@@ -437,7 +380,6 @@ async def send_session_update(openai_ws, instructions):
     }
     print('Sending session update:', json.dumps(session_update))
     await openai_ws.send(json.dumps(session_update))
-
 
 if __name__ == "__main__":
     import uvicorn
