@@ -14,7 +14,6 @@ from dotenv import load_dotenv
 from supabase import create_client, Client
 from openai import OpenAI
 
-
 load_dotenv()
 
 APYHUB_API_KEY = os.getenv("APYHUB_API_KEY", "")
@@ -42,7 +41,6 @@ try:
 except Exception:
     # If OPENAI_API_KEY isn't configured at import time, we'll fail lazily when used
     openai_client = None
-
 
 class ApyHubClient:
     """Minimal ApyHub client for generating summaries by URL or file.

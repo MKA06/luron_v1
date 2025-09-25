@@ -8,7 +8,8 @@ import wave
 import io
 import time
 from typing import Any, Dict, Optional
-from fastapi import FastAPI, WebSocket, Request, UploadFile, File, Form
+from fastapi import FastAPI, WebSocket, Request, UploadFile, File, Form, Depends, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.websockets import WebSocketDisconnect
 from twilio.twiml.voice_response import VoiceResponse, Connect, Say, Stream
@@ -42,6 +43,26 @@ LOG_EVENT_TYPES = [
     'input_audio_buffer.speech_started', 'session.created'
 ]
 app = FastAPI()
+
+# CORS for frontend OAuth calls
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+        "http://localhost:4173",
+        "http://127.0.0.1:4173",
+        "http://localhost:8080",
+        "http://127.0.0.1:8080",
+        "http://localhost:4000",
+        "http://127.0.0.1:4000",
+        # add your deployed frontend origins here
+    ],
+    allow_origin_regex=r"https?://(localhost|127\\.0\\.0\\.1)(:\\d+)?",
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 if not OPENAI_API_KEY:
     raise ValueError('Missing the OpenAI API key. Please set it in the .env file.')
 
@@ -51,6 +72,57 @@ try:
     app.include_router(outbound_router)
 except Exception:
     pass
+
+# Google OAuth credential intake endpoint
+
+from fastapi import APIRouter
+from gcal import GoogleOAuthPayload, build_credentials, get_calendar_service, get_gmail_service
+
+google_router = APIRouter(prefix="/google", tags=["google"])
+
+@google_router.post("/auth")
+async def receive_google_oauth(payload: GoogleOAuthPayload):
+    """Accept Google OAuth tokens for a user and do a minimal no-op call to verify.
+
+    Frontend should send access_token (and optionally refresh_token, client_id, client_secret, scopes).
+    """
+    try:
+        creds = build_credentials(payload)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Invalid credentials payload: {e}")
+
+    # Optionally: perform a lightweight verification call. Gate by requested service.
+    try:
+        print("/google/auth: credential payload received")
+        services: set[str] = set()
+        if payload.service:
+            # Strict gating: if service is specified, verify only that service
+            services.add(payload.service)
+        else:
+            # Fallback inference from scopes, if provided
+            if payload.scopes:
+                if any(s.startswith("https://www.googleapis.com/auth/calendar") for s in payload.scopes):
+                    services.add("calendar")
+                if any(s.startswith("https://www.googleapis.com/auth/gmail") for s in payload.scopes):
+                    services.add("gmail")
+
+        if "calendar" in services:
+            cal = get_calendar_service(creds)
+            # Probe events on primary; compatible with calendar.events.readonly or calendar.readonly
+            cal.events().list(calendarId='primary', maxResults=1).execute()
+
+        if "gmail" in services:
+            gmail = get_gmail_service(creds)
+            # Probe profile call
+            gmail.users().getProfile(userId="me").execute()
+    except Exception as e:
+        raise HTTPException(status_code=401, detail=f"Credential verification failed: {e}")
+
+    # In a real application you would persist association: payload.user_id -> encrypted tokens.
+    return {"ok": True}
+
+app.include_router(google_router)
+
 
 async def get_weather():
     print("started")
