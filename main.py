@@ -446,6 +446,8 @@ async def handle_media_stream_with_agent(websocket: WebSocket, agent_id: str):
                         # Trigger initial assistant welcome via OpenAI once stream is ready
                         try:
                             if agent_welcome:
+                                # Add a small delay to ensure VAD is ready
+                                await asyncio.sleep(0.2)
                                 await openai_ws.send(json.dumps({
                                     "type": "response.create",
                                     "response": {
@@ -488,8 +490,7 @@ async def handle_media_stream_with_agent(websocket: WebSocket, agent_id: str):
                     if response['type'] == 'session.updated':
                         print("Session updated successfully:", response)
 
-                    # Handle barge-in when user starts speaking 
-                    
+                    # Handle barge-in when user starts speaking
                     if response['type'] == 'input_audio_buffer.speech_started':
                         # Begin capturing a user utterance
                         is_user_speaking = True
@@ -515,6 +516,7 @@ async def handle_media_stream_with_agent(websocket: WebSocket, agent_id: str):
                             })
                         is_user_speaking = False
 
+                    
                     if response['type'] == 'response.output_audio.delta' and response.get('delta'):
                         # Audio from OpenAI
                         try:
@@ -558,19 +560,8 @@ async def handle_media_stream_with_agent(websocket: WebSocket, agent_id: str):
                                         args = json.loads(args_json)
                                     except Exception:
                                         args = {}
-
-                                    # 1) Immediately ask the model to tell user to wait
-                                    wait_event = {
-                                        "type": "response.create",
-                                        "response": {
-                                            # Remove prior context to ensure a short hold message
-                                            "input": [],
-                                            "instructions": "Say exactly: 'Wait here while I check.' Keep it short.",
-                                        }
-                                    }
-                                    await openai_ws.send(json.dumps(wait_event))
-
-                                    # 2) Queue the tool execution
+                                    
+                                    # Queue the tool execution without interrupting current speech
                                     await tool_queue.put({
                                         "name": name,
                                         "call_id": call_id,
@@ -613,7 +604,12 @@ async def send_session_update(openai_ws, instructions):
             "audio": {
                 "input": {
                     "format": {"type": "audio/pcmu"},
-                    "turn_detection": {"type": "server_vad"}
+                    "turn_detection": {
+                        "type": "server_vad",
+                        "threshold": 0.7,
+                        "prefix_padding_ms": 500,
+                        "silence_duration_ms": 1000
+                    }
                 },
                 "output": {
                     "format": {"type": "audio/pcmu"},
