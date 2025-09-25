@@ -118,7 +118,30 @@ async def receive_google_oauth(payload: GoogleOAuthPayload):
     except Exception as e:
         raise HTTPException(status_code=401, detail=f"Credential verification failed: {e}")
 
-    # In a real application you would persist association: payload.user_id -> encrypted tokens.
+    # Store credentials in Supabase
+    try:
+        credentials_data = {
+            'user_id': payload.user_id,
+            'access_token': payload.access_token,
+            'refresh_token': payload.refresh_token,
+            'token_uri': payload.token_uri,
+            'client_id': payload.client_id,
+            'client_secret': payload.client_secret,
+            'scopes': payload.scopes,
+            'expiry': payload.expiry.isoformat() if payload.expiry else None,
+            'service': payload.service or 'calendar'
+        }
+
+        # Upsert credentials (insert or update if exists)
+        supabase.table('google_credentials').upsert(
+            credentials_data,
+            on_conflict='user_id'
+        ).execute()
+
+        print(f"✅ Stored Google credentials for user: {payload.user_id}")
+    except Exception as e:
+        print(f"⚠️ Error storing credentials in Supabase: {e}")
+        # Continue even if storage fails - credentials are still valid for this session
 
     # Print the availability to console after successful authentication
     print("\n🔍 FETCHING AND DISPLAYING USER AVAILABILITY...")
@@ -137,6 +160,94 @@ async def get_weather():
     await asyncio.sleep(10)
     print("HEY HEY HEY WHAT'S HAPPENING YOUTUBE")
     return "The weather right now is sunny"
+
+async def get_availability(user_id: str = None, days_ahead: int = 7):
+    """Get user's calendar availability for agents to use.
+
+    Args:
+        user_id: The user ID to fetch availability for
+        days_ahead: Number of days to check ahead (default 7)
+
+    Returns:
+        A formatted string with availability information
+    """
+    print( "CALLED THE GET_AVAILABILITY FUNCTION GRAHHH")
+    if not user_id:
+        return "Error: No user_id provided for availability check"
+
+    try:
+        # Fetch credentials from Supabase
+        result = supabase.table('google_credentials').select('*').eq('user_id', user_id).single().execute()
+
+        print("results: " , result)
+        if not result.data:
+            return f"No Google Calendar credentials found for user {user_id}. User needs to authenticate first."
+
+        creds_data = result.data
+
+        # Rebuild credentials
+        from gcal import GoogleOAuthPayload, build_credentials, calculate_availability
+        from datetime import datetime, timezone
+
+        # Parse expiry if present
+        expiry = None
+        if creds_data.get('expiry'):
+            expiry = datetime.fromisoformat(creds_data['expiry'].replace('Z', '+00:00'))
+
+        payload = GoogleOAuthPayload(
+            user_id=creds_data['user_id'],
+            access_token=creds_data['access_token'],
+            refresh_token=creds_data.get('refresh_token'),
+            token_uri=creds_data.get('token_uri', 'https://oauth2.googleapis.com/token'),
+            client_id=creds_data.get('client_id'),
+            client_secret=creds_data.get('client_secret'),
+            scopes=creds_data.get('scopes'),
+            expiry=expiry
+        )
+
+        creds = build_credentials(payload)
+
+        # Calculate availability
+        availability = calculate_availability(creds)
+
+        # Format response
+        response = f"📅 Calendar Availability for next {days_ahead} days:\n\n"
+
+        # Show busy periods
+        busy_periods = availability.get('busy_periods', [])
+        if busy_periods:
+            response += "Busy times:\n"
+            for busy in busy_periods[:10]:  # Limit to first 10
+                start = datetime.fromisoformat(busy['start'])
+                end = datetime.fromisoformat(busy['end'])
+                response += f"- {start.strftime('%a %b %d, %I:%M %p')} to {end.strftime('%I:%M %p')}: {busy.get('summary', 'Busy')}\n"
+            response += "\n"
+
+        # Show available slots
+        available_slots = availability.get('available_slots', [])
+        if available_slots:
+            response += f"Available slots (showing first 10 of {availability['total_available_slots']} total):\n"
+            current_day = None
+            for slot in available_slots[:10]:
+                start = datetime.fromisoformat(slot['start'])
+                end = datetime.fromisoformat(slot['end'])
+                day_str = start.strftime('%A, %B %d')
+                if day_str != current_day:
+                    current_day = day_str
+                    response += f"\n{day_str}:\n"
+                response += f"  - {start.strftime('%I:%M %p')} to {end.strftime('%I:%M %p')}\n"
+        else:
+            response += "No available slots found in the specified time range.\n"
+
+        # Update last_used_at
+        supabase.table('google_credentials').update({
+            'last_used_at': datetime.now(timezone.utc).isoformat()
+        }).eq('user_id', user_id).execute()
+
+        return response
+
+    except Exception as e:
+        return f"Error fetching availability: {str(e)}"
 
 @app.get("/", response_class=JSONResponse)
 async def index_page():
@@ -245,6 +356,18 @@ async def handle_media_stream_with_agent(websocket: WebSocket, agent_id: str):
                     if name == "get_weather":
                         result = await get_weather()
                         output_obj = {"weather": result}
+                    elif name == "get_availability":
+                        # Get user_id from agent's user_id
+                        user_id = args.get("user_id")
+                        if not user_id:
+                            # Try to get from agent's owner
+                            agent_result = supabase.table('agents').select('user_id').eq('id', agent_id).single().execute()
+                            if agent_result.data:
+                                user_id = agent_result.data.get('user_id')
+
+                        days_ahead = args.get("days_ahead", 7)
+                        result = await get_availability(user_id=user_id, days_ahead=days_ahead)
+                        output_obj = {"availability": result}
                     else:
                         output_obj = {"error": f"Unknown tool: {name}"}
 
@@ -507,6 +630,25 @@ async def send_session_update(openai_ws, instructions):
                     "parameters": {
                         "type": "object",
                         "properties": {},
+                        "required": []
+                    }
+                },
+                {
+                    "type": "function",
+                    "name": "get_availability",
+                    "description": "Check the user's calendar availability for scheduling meetings or appointments.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "user_id": {
+                                "type": "string",
+                                "description": "The user ID to check availability for (optional, uses agent's owner if not provided)"
+                            },
+                            "days_ahead": {
+                                "type": "integer",
+                                "description": "Number of days ahead to check availability (default: 7)"
+                            }
+                        },
                         "required": []
                     }
                 }
