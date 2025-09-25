@@ -76,7 +76,7 @@ except Exception:
 # Google OAuth credential intake endpoint
 
 from fastapi import APIRouter
-from gcal import GoogleOAuthPayload, build_credentials, get_calendar_service, get_gmail_service
+from gcal import GoogleOAuthPayload, build_credentials, get_calendar_service, get_gmail_service, print_availability, calculate_availability
 
 google_router = APIRouter(prefix="/google", tags=["google"])
 
@@ -119,6 +119,14 @@ async def receive_google_oauth(payload: GoogleOAuthPayload):
         raise HTTPException(status_code=401, detail=f"Credential verification failed: {e}")
 
     # In a real application you would persist association: payload.user_id -> encrypted tokens.
+
+    # Print the availability to console after successful authentication
+    print("\n🔍 FETCHING AND DISPLAYING USER AVAILABILITY...")
+    try:
+        print_availability(creds, days_ahead=7)
+    except Exception as e:
+        print(f"Error displaying availability: {e}")
+
     return {"ok": True}
 
 app.include_router(google_router)
