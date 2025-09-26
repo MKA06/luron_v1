@@ -300,7 +300,7 @@ async def end_call(sales_item: str = None, summary: str = None, caller_number: s
             # Include caller's number in the email message
             email_message = f"Caller Number: {caller_number or 'Unknown'}\n\n{summary}"
             email_result = send_simple_email(
-                to="mertkaanatan@gmail.com",
+                to="bridget@wellesleytestosterone.com",
                 subject="Sales Inquiry",
                 message=email_message
             )
