@@ -228,7 +228,9 @@ async def set_meeting(user_id: str = None,
                       description: str = None,
                       location: str = None):
     """Schedule a meeting in the user's Google Calendar.
-
+    
+    This is a wrapper function that calls the actual implementation in gcal.py.
+    
     Args:
         user_id: The user ID whose calendar to update
         meeting_name: Title/summary of the meeting
@@ -240,151 +242,22 @@ async def set_meeting(user_id: str = None,
     Returns:
         A formatted string with meeting creation status
     """
-    print("CALLED THE SET_MEETING FUNCTION")
-
-    if not user_id:
-        return "Error: No user_id provided for scheduling meeting"
-
-    if not meeting_name:
-        return "Error: No meeting name provided"
-
-    if not meeting_time:
-        return "Error: No meeting time provided"
-
-    try:
-        # Fetch credentials from Supabase
-        print(f"Fetching credentials for user_id: {user_id}")
-        result = supabase.table('google_credentials').select('*').eq('user_id', user_id).single().execute()
-
-        print(f"Credentials query result: {result}")
-        if not result.data:
-            return f"No Google Calendar credentials found for user {user_id}. User needs to authenticate first."
-
-        creds_data = result.data
-        print(f"Found credentials for user: {creds_data.get('user_id')}")
-
-        # Check if token needs refresh
-        from datetime import datetime, timezone, timedelta
-        from dateutil import parser
-
-        needs_refresh = False
-        if creds_data.get('expiry'):
-            expiry = datetime.fromisoformat(creds_data['expiry'].replace('Z', '+00:00'))
-            if expiry <= datetime.now(timezone.utc) + timedelta(minutes=5):
-                needs_refresh = True
-                print(f"Token expired or expiring soon, refreshing...")
-
-        # Refresh token if needed
-        if needs_refresh and creds_data.get('refresh_token'):
-            try:
-                token_response = refresh_access_token(
-                    refresh_token=creds_data['refresh_token'],
-                    client_id=creds_data['client_id'],
-                    client_secret=creds_data['client_secret'],
-                    token_uri=creds_data.get('token_uri', 'https://oauth2.googleapis.com/token')
-                )
-
-                # Update credentials in database
-                expires_in = token_response.get('expires_in', 3600)
-                new_expiry = datetime.now(timezone.utc) + timedelta(seconds=expires_in)
-
-                update_data = {
-                    'access_token': token_response['access_token'],
-                    'expiry': new_expiry.isoformat(),
-                    'updated_at': datetime.now(timezone.utc).isoformat()
-                }
-
-                supabase.table('google_credentials').update(update_data).eq('user_id', user_id).execute()
-                creds_data['access_token'] = token_response['access_token']
-                creds_data['expiry'] = new_expiry.isoformat()
-                print("Successfully refreshed access token")
-            except Exception as e:
-                print(f"Error refreshing token: {e}")
-                return f"Error: Token expired and could not be refreshed. User needs to re-authenticate."
-
-        # Rebuild credentials
-        from gcal import GoogleOAuthPayload, build_credentials, create_calendar_event
-
-        # Parse expiry if present
-        expiry = None
-        if creds_data.get('expiry'):
-            expiry = datetime.fromisoformat(creds_data['expiry'].replace('Z', '+00:00'))
-
-        payload = GoogleOAuthPayload(
-            user_id=creds_data['user_id'],
-            access_token=creds_data['access_token'],
-            refresh_token=creds_data.get('refresh_token'),
-            token_uri=creds_data.get('token_uri', 'https://oauth2.googleapis.com/token'),
-            client_id=creds_data.get('client_id'),
-            client_secret=creds_data.get('client_secret'),
-            scopes=creds_data.get('scopes'),
-            expiry=expiry
-        )
-
-        creds = build_credentials(payload)
-
-        # Parse the meeting time
-        try:
-            # Try to parse as ISO format or natural language
-            print(f"Parsing meeting time: {meeting_time}")
-            start_time = parser.parse(meeting_time)
-
-            # Ensure timezone aware
-            if start_time.tzinfo is None:
-                start_time = start_time.replace(tzinfo=timezone.utc)
-            print(f"Parsed start time: {start_time}")
-        except Exception as e:
-            print(f"Error parsing time: {e}")
-            return f"Error: Could not parse meeting time '{meeting_time}'. Please provide a valid date/time."
-
-        # Calculate end time
-        end_time = start_time + timedelta(minutes=duration_minutes)
-        print(f"Meeting details: {meeting_name} from {start_time} to {end_time}")
-
-        # Create the calendar event
-        print("Calling create_calendar_event...")
-        result = create_calendar_event(
-            credentials=creds,
-            summary=meeting_name,
-            start_time=start_time,
-            end_time=end_time,
-            description=description,
-            location=location
-        )
-
-        # Update last_used_at
-        supabase.table('google_credentials').update({
-            'last_used_at': datetime.now(timezone.utc).isoformat()
-        }).eq('user_id', user_id).execute()
-
-        print(f"Create calendar event result: {result}")
-
-        # Format response
-        if result.get('success'):
-            response = f"✅ Meeting scheduled successfully!\n\n"
-            response += f"📅 {meeting_name}\n"
-            response += f"🕐 {start_time.strftime('%A, %B %d at %I:%M %p')}\n"
-            response += f"⏱️ Duration: {duration_minutes} minutes\n"
-            if location:
-                response += f"📍 Location: {location}\n"
-            response += f"\n🔗 Calendar link: {result.get('html_link', 'N/A')}"
-            print(f"Success response: {response}")
-            return response
-        else:
-            error_msg = f"❌ Failed to schedule meeting: {result.get('error', 'Unknown error')}"
-            print(f"Error response: {error_msg}")
-            return error_msg
-
-    except Exception as e:
-        error_msg = f"Error scheduling meeting: {str(e)}"
-        print(f"Exception in set_meeting: {error_msg}")
-        import traceback
-        print(f"Traceback: {traceback.format_exc()}")
-        return error_msg
+    from gcal import set_meeting as gcal_set_meeting
+    return await gcal_set_meeting(
+        supabase=supabase,
+        user_id=user_id,
+        meeting_name=meeting_name,
+        meeting_time=meeting_time,
+        duration_minutes=duration_minutes,
+        description=description,
+        location=location
+    )
 
 
 async def get_availability(user_id: str = None, days_ahead: int = 7):
     """Get user's calendar availability for agents to use.
+    
+    This is a wrapper function that calls the actual implementation in gcal.py.
 
     Args:
         user_id: The user ID to fetch availability for
@@ -393,120 +266,12 @@ async def get_availability(user_id: str = None, days_ahead: int = 7):
     Returns:
         A formatted string with availability information
     """
-    print( "CALLED THE GET_AVAILABILITY FUNCTION GRAHHH")
-    if not user_id:
-        return "Error: No user_id provided for availability check"
-
-    try:
-        # Fetch credentials from Supabase
-        result = supabase.table('google_credentials').select('*').eq('user_id', user_id).single().execute()
-
-        print("results: " , result)
-        if not result.data:
-            return f"No Google Calendar credentials found for user {user_id}. User needs to authenticate first."
-
-        creds_data = result.data
-
-        # Check if token needs refresh
-        from datetime import datetime, timezone, timedelta
-
-        needs_refresh = False
-        if creds_data.get('expiry'):
-            expiry = datetime.fromisoformat(creds_data['expiry'].replace('Z', '+00:00'))
-            if expiry <= datetime.now(timezone.utc) + timedelta(minutes=5):
-                needs_refresh = True
-                print(f"Token expired or expiring soon, refreshing...")
-
-        # Refresh token if needed
-        if needs_refresh and creds_data.get('refresh_token'):
-            try:
-                token_response = refresh_access_token(
-                    refresh_token=creds_data['refresh_token'],
-                    client_id=creds_data['client_id'],
-                    client_secret=creds_data['client_secret'],
-                    token_uri=creds_data.get('token_uri', 'https://oauth2.googleapis.com/token')
-                )
-
-                # Update credentials in database
-                expires_in = token_response.get('expires_in', 3600)
-                new_expiry = datetime.now(timezone.utc) + timedelta(seconds=expires_in)
-
-                update_data = {
-                    'access_token': token_response['access_token'],
-                    'expiry': new_expiry.isoformat(),
-                    'updated_at': datetime.now(timezone.utc).isoformat()
-                }
-
-                supabase.table('google_credentials').update(update_data).eq('user_id', user_id).execute()
-                creds_data['access_token'] = token_response['access_token']
-                creds_data['expiry'] = new_expiry.isoformat()
-                print("Successfully refreshed access token")
-            except Exception as e:
-                print(f"Error refreshing token: {e}")
-                return f"Error: Token expired and could not be refreshed. User needs to re-authenticate."
-
-        # Rebuild credentials
-        from gcal import GoogleOAuthPayload, build_credentials, calculate_availability
-
-        # Parse expiry if present
-        expiry = None
-        if creds_data.get('expiry'):
-            expiry = datetime.fromisoformat(creds_data['expiry'].replace('Z', '+00:00'))
-
-        payload = GoogleOAuthPayload(
-            user_id=creds_data['user_id'],
-            access_token=creds_data['access_token'],
-            refresh_token=creds_data.get('refresh_token'),
-            token_uri=creds_data.get('token_uri', 'https://oauth2.googleapis.com/token'),
-            client_id=creds_data.get('client_id'),
-            client_secret=creds_data.get('client_secret'),
-            scopes=creds_data.get('scopes'),
-            expiry=expiry
-        )
-
-        creds = build_credentials(payload)
-
-        # Calculate availability
-        availability = calculate_availability(creds)
-
-        # Format response
-        response = f"📅 Calendar Availability for next {days_ahead} days:\n\n"
-
-        # Show busy periods
-        busy_periods = availability.get('busy_periods', [])
-        if busy_periods:
-            response += "Busy times:\n"
-            for busy in busy_periods[:10]:  # Limit to first 10
-                start = datetime.fromisoformat(busy['start'])
-                end = datetime.fromisoformat(busy['end'])
-                response += f"- {start.strftime('%a %b %d, %I:%M %p')} to {end.strftime('%I:%M %p')}: {busy.get('summary', 'Busy')}\n"
-            response += "\n"
-
-        # Show available slots
-        available_slots = availability.get('available_slots', [])
-        if available_slots:
-            response += f"Available slots (showing first 10 of {availability['total_available_slots']} total):\n"
-            current_day = None
-            for slot in available_slots[:10]:
-                start = datetime.fromisoformat(slot['start'])
-                end = datetime.fromisoformat(slot['end'])
-                day_str = start.strftime('%A, %B %d')
-                if day_str != current_day:
-                    current_day = day_str
-                    response += f"\n{day_str}:\n"
-                response += f"  - {start.strftime('%I:%M %p')} to {end.strftime('%I:%M %p')}\n"
-        else:
-            response += "No available slots found in the specified time range.\n"
-
-        # Update last_used_at
-        supabase.table('google_credentials').update({
-            'last_used_at': datetime.now(timezone.utc).isoformat()
-        }).eq('user_id', user_id).execute()
-
-        return response
-
-    except Exception as e:
-        return f"Error fetching availability: {str(e)}"
+    from gcal import get_availability as gcal_get_availability
+    return await gcal_get_availability(
+        supabase=supabase,
+        user_id=user_id,
+        days_ahead=days_ahead
+    )
 
 @app.get("/", response_class=JSONResponse)
 async def index_page():
@@ -625,7 +390,10 @@ async def handle_media_stream_with_agent(websocket: WebSocket, agent_id: str):
                                 user_id = agent_result.data.get('user_id')
 
                         days_ahead = args.get("days_ahead", 7)
-                        result = await get_availability(user_id=user_id, days_ahead=days_ahead)
+                        result = await get_availability(
+                            user_id=user_id,
+                            days_ahead=days_ahead
+                        )
                         output_obj = {"availability": result}
                     elif name == "set_meeting":
                         # Get user_id from agent's user_id
@@ -717,46 +485,37 @@ async def handle_media_stream_with_agent(websocket: WebSocket, agent_id: str):
                             twilio_call_sid = data['start'].get('callSid')
                             if twilio_call_sid:
                                 try:
-                                    lookup = supabase.table('calls').select('id').eq('twilio_call_sid', twilio_call_sid).eq('agent_id', agent_id).order('created_at', desc=True).limit(1).execute()
+                                    lookup = supabase.table('calls').select('id, from_number').eq('twilio_call_sid', twilio_call_sid).eq('agent_id', agent_id).order('created_at', desc=True).limit(1).execute()
                                     if lookup.data:
                                         db_call_id = lookup.data[0].get('id')
+                                        from_number = lookup.data[0].get('from_number')
+                                        print(f"Call from: {from_number}")
                                 except Exception as e:
                                     print(f"Failed to lookup call record: {e}")
                         except Exception:
                             pass
                         if call_started_monotonic is None:
                             call_started_monotonic = time.monotonic()
-                        # Trigger initial assistant welcome via OpenAI once stream is ready
-                        try:
-                            if agent_welcome:
-                                # Add a small delay to ensure VAD is ready
-                                await asyncio.sleep(0.2)
-                                await openai_ws.send(json.dumps({
-                                    "type": "response.create",
-                                    "response": {
-                                        "instructions": f"Greet the user by saying exactly: {agent_welcome}"
-                                    }
-                                }))
-                        except Exception as e:
-                            print(f"Failed to send initial welcome: {e}")
+                        # Send welcome message
+                        if agent_welcome:
+                            await openai_ws.send(json.dumps({
+                                "type": "response.create",
+                                "response": {
+                                    "instructions": f"Greet the user by saying exactly: {agent_welcome}"
+                                }
+                            }))
                     elif data['event'] == 'stop':
-                        # Twilio indicates call is ending; close OpenAI WS and exit loop
+                        # Call ending
                         print(f"Stream stopped {stream_sid}")
-                        # Finalize any in-progress user utterance
                         if is_user_speaking and current_user_buffer:
                             conversation.append({
                                 "role": "user",
                                 "audio_bytes": bytes(current_user_buffer)
                             })
-                            current_user_buffer = bytearray()
                             is_user_speaking = False
                         call_ended_monotonic = time.monotonic()
-                        try:
-                            if openai_ws.state.name == 'OPEN':
-                                await openai_ws.close()
-                        except Exception:
-                            pass
-                        # Exit receive loop to allow gather to finish and trigger cleanup
+                        if openai_ws.state.name == 'OPEN':
+                            await openai_ws.close()
                         return
             except WebSocketDisconnect:
                 print("Client disconnected.")
@@ -773,7 +532,6 @@ async def handle_media_stream_with_agent(websocket: WebSocket, agent_id: str):
                     if response['type'] == 'session.updated':
                         print("Session updated successfully:", response)
 
-                    # Handle barge-in when user starts speaking
                     if response['type'] == 'input_audio_buffer.speech_started':
                         # Begin capturing a user utterance
                         is_user_speaking = True
@@ -887,12 +645,7 @@ async def send_session_update(openai_ws, instructions):
             "audio": {
                 "input": {
                     "format": {"type": "audio/pcmu"},
-                    "turn_detection": {
-                        "type": "server_vad",
-                        "threshold": 0.7,
-                        "prefix_padding_ms": 500,
-                        "silence_duration_ms": 1000
-                    }
+                    "turn_detection": {"type": "server_vad"}
                 },
                 "output": {
                     "format": {"type": "audio/pcmu"},
