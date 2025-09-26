@@ -60,6 +60,7 @@ app.add_middleware(
         "http://127.0.0.1:8080",
         "http://localhost:4000",
         "http://127.0.0.1:4000",
+        "https://app.luron.ai",
         # add your deployed frontend origins here
     ],
     allow_origin_regex=r"https?://(localhost|127\\.0\\.0\\.1)(:\\d+)?",
@@ -528,7 +529,7 @@ async def handle_media_stream_with_agent(websocket: WebSocket, agent_id: str):
 
         worker_task = asyncio.create_task(tool_worker())
 
-        await send_session_update(openai_ws, agent_prompt)
+        await send_session_update(openai_ws, agent_prompt, agent_id)
         stream_sid = None
         async def receive_from_twilio():
             """Receive audio data from Twilio and send it to the OpenAI Realtime API."""
@@ -757,8 +758,97 @@ async def handle_media_stream_with_agent(websocket: WebSocket, agent_id: str):
 
 
 
-async def send_session_update(openai_ws, instructions):
+async def send_session_update(openai_ws, instructions, agent_id=None):
     """Send session update to OpenAI WebSocket."""
+    # Only include tools for the specific agent ID
+    tools = []
+    if agent_id == "398d539b-cc3b-430c-bbc8-3394d940c03c":
+        tools = [
+            {
+                "type": "function",
+                "name": "get_weather",
+                "description": "Get the current weather conditions.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {},
+                    "required": []
+                }
+            },
+            {
+                "type": "function",
+                "name": "get_availability",
+                "description": "Check the user's calendar availability for scheduling meetings or appointments.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "user_id": {
+                            "type": "string",
+                            "description": "The user ID to check availability for (optional, uses agent's owner if not provided)"
+                        },
+                        "days_ahead": {
+                            "type": "integer",
+                            "description": "Number of days ahead to check availability (default: 7)"
+                        }
+                    },
+                    "required": []
+                }
+            },
+            {
+                "type": "function",
+                "name": "set_meeting",
+                "description": "Schedule a meeting in the user's Google Calendar.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "meeting_name": {
+                            "type": "string",
+                            "description": "The title or name of the meeting"
+                        },
+                        "meeting_time": {
+                            "type": "string",
+                            "description": "The date and time for the meeting (e.g., '2024-12-25 14:00' or 'tomorrow at 2pm')"
+                        },
+                        "duration_minutes": {
+                            "type": "integer",
+                            "description": "Duration of the meeting in minutes (default: 60)"
+                        },
+                        "description": {
+                            "type": "string",
+                            "description": "Optional description or agenda for the meeting"
+                        },
+                        "location": {
+                            "type": "string",
+                            "description": "Optional location for the meeting"
+                        },
+                        "user_id": {
+                            "type": "string",
+                            "description": "The user ID whose calendar to update (optional, uses agent's owner if not provided)"
+                        }
+                    },
+                    "required": ["meeting_name", "meeting_time"]
+                }
+            },
+            {
+                "type": "function",
+                "name": "end_call",
+                "description": "End the call when the caller is trying to sell something. First record what they're trying to sell, say thank you, then end the call politely. Also accepts a short summary text for follow-up email which will include the caller's phone number.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "sales_item": {
+                            "type": "string",
+                            "description": "Description of what the caller is trying to sell"
+                        },
+                        "summary": {
+                            "type": "string",
+                            "description": "Short summary of the sales inquiry to email after call"
+                        }
+                    },
+                    "required": []
+                }
+            }
+        ]
+
     session_update = {
         "type": "session.update",
         "session": {
@@ -777,91 +867,7 @@ async def send_session_update(openai_ws, instructions):
             },
             "instructions": instructions,
             # Configure function calling tools at the session level
-            "tools": [
-                {
-                    "type": "function",
-                    "name": "get_weather",
-                    "description": "Get the current weather conditions.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {},
-                        "required": []
-                    }
-                },
-                {
-                    "type": "function",
-                    "name": "get_availability",
-                    "description": "Check the user's calendar availability for scheduling meetings or appointments.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "user_id": {
-                                "type": "string",
-                                "description": "The user ID to check availability for (optional, uses agent's owner if not provided)"
-                            },
-                            "days_ahead": {
-                                "type": "integer",
-                                "description": "Number of days ahead to check availability (default: 7)"
-                            }
-                        },
-                        "required": []
-                    }
-                },
-                {
-                    "type": "function",
-                    "name": "set_meeting",
-                    "description": "Schedule a meeting in the user's Google Calendar.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "meeting_name": {
-                                "type": "string",
-                                "description": "The title or name of the meeting"
-                            },
-                            "meeting_time": {
-                                "type": "string",
-                                "description": "The date and time for the meeting (e.g., '2024-12-25 14:00' or 'tomorrow at 2pm')"
-                            },
-                            "duration_minutes": {
-                                "type": "integer",
-                                "description": "Duration of the meeting in minutes (default: 60)"
-                            },
-                            "description": {
-                                "type": "string",
-                                "description": "Optional description or agenda for the meeting"
-                            },
-                            "location": {
-                                "type": "string",
-                                "description": "Optional location for the meeting"
-                            },
-                            "user_id": {
-                                "type": "string",
-                                "description": "The user ID whose calendar to update (optional, uses agent's owner if not provided)"
-                            }
-                        },
-                        "required": ["meeting_name", "meeting_time"]
-                    }
-                },
-                {
-                    "type": "function",
-                    "name": "end_call",
-                    "description": "End the call when the caller is trying to sell something. First record what they're trying to sell, say thank you, then end the call politely. Also accepts a short summary text for follow-up email which will include the caller's phone number.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "sales_item": {
-                                "type": "string",
-                                "description": "Description of what the caller is trying to sell"
-                            },
-                            "summary": {
-                                "type": "string",
-                                "description": "Short summary of the sales inquiry to email after call"
-                            }
-                        },
-                        "required": []
-                    }
-                }
-            ],
+            "tools": tools,
             "tool_choice": "auto",
         }
     }
