@@ -273,6 +273,43 @@ async def get_availability(user_id: str = None, days_ahead: int = 7):
         days_ahead=days_ahead
     )
 
+
+async def end_call(sales_item: str = None, summary: str = None, caller_number: str = None):
+    """End the call after recording what the caller is trying to sell.
+
+    This function is used when the caller is identified as trying to sell something.
+    It records what they're selling and ends the call politely.
+
+    Args:
+        sales_item: Description of what the caller is trying to sell
+        summary: Summary of the sales inquiry
+        caller_number: The phone number of the caller
+
+    Returns:
+        A signal that indicates the call should end
+    """
+    # Record the sales attempt if sales_item is provided
+    if sales_item:
+        print(f"Caller trying to sell: {sales_item}")
+        # TODO: Optionally store this in the database for tracking
+    if summary:
+        print(f"Sales summary: {summary}")
+        try:
+            from email_service import send_simple_email
+            # Include caller's number in the email message
+            email_message = f"Caller Number: {caller_number or 'Unknown'}\n\n{summary}"
+            email_result = send_simple_email(
+                to="mertkaanatan@gmail.com",
+                subject="Sales Inquiry",
+                message=email_message
+            )
+            print(f"End-call email sent: {email_result}")
+        except Exception as e:
+            print(f"Failed to send end-call email: {e}")
+
+    # Return a signal that indicates the call should end
+    return "END_CALL_SIGNAL"
+
 @app.get("/", response_class=JSONResponse)
 async def index_page():
     return {"message": "Twilio Media Stream Server is running!"}
@@ -365,8 +402,14 @@ async def handle_media_stream_with_agent(websocket: WebSocket, agent_id: str):
         call_ended_monotonic: Optional[float] = None
         db_call_id: Optional[str] = None
         twilio_call_sid: Optional[str] = None
+        should_end_call: bool = False  # Flag to signal call termination
+        goodbye_audio_bytes: int = 0    # Bytes of goodbye audio sent after end_call
+        # Control barge-in behavior around the welcome message
+        barge_in_allowed: bool = True
+        welcome_in_progress: bool = False
 
         async def tool_worker():
+            nonlocal websocket, should_end_call, goodbye_audio_bytes  # Add needed nonlocals
             while True:
                 job = await tool_queue.get()
                 if job is None:  # shutdown signal
@@ -419,6 +462,32 @@ async def handle_media_stream_with_agent(websocket: WebSocket, agent_id: str):
                             location=location
                         )
                         output_obj = {"meeting": result}
+                    elif name == "end_call":
+                        # Get sales_item from arguments
+                        sales_item = args.get("sales_item")
+                        summary = args.get("summary")
+                        # Get caller's phone number from the lookup we did earlier
+                        caller_number = None
+                        if db_call_id:
+                            try:
+                                lookup = supabase.table('calls').select('from_number').eq('id', db_call_id).single().execute()
+                                if lookup.data:
+                                    caller_number = lookup.data.get('from_number')
+                            except Exception as e:
+                                print(f"Failed to get caller number: {e}")
+                        result = await end_call(sales_item=sales_item, summary=summary, caller_number=caller_number)
+                        
+                        # If this is the end call signal, we need to close the connection
+                        if result == "END_CALL_SIGNAL":
+                            # Send a final message before closing
+                            output_obj = {"message": "Thank you for your time. Have a great day!"}
+                            
+                            # Set the flag to end the call
+                            should_end_call = True
+                            goodbye_audio_bytes = 0
+                            print("End call signal set - call will terminate after response")
+                        else:
+                            output_obj = {"status": result}
                     else:
                         output_obj = {"error": f"Unknown tool: {name}"}
 
@@ -435,6 +504,10 @@ async def handle_media_stream_with_agent(websocket: WebSocket, agent_id: str):
                     await openai_ws.send(json.dumps(item_event))
 
                     await openai_ws.send(json.dumps({"type": "response.create"}))
+                    
+                    # If end_call was triggered, wait for response to be sent
+                    if name == "end_call" and should_end_call:
+                        await asyncio.sleep(2)  # Give time for the response to be generated and sent
                 except Exception as e:
                     # On error, still inform the model so it can recover
                     error_item = {
@@ -459,7 +532,7 @@ async def handle_media_stream_with_agent(websocket: WebSocket, agent_id: str):
         stream_sid = None
         async def receive_from_twilio():
             """Receive audio data from Twilio and send it to the OpenAI Realtime API."""
-            nonlocal stream_sid, is_user_speaking, current_user_buffer, call_started_monotonic, call_ended_monotonic, twilio_call_sid, db_call_id
+            nonlocal stream_sid, is_user_speaking, current_user_buffer, call_started_monotonic, call_ended_monotonic, twilio_call_sid, db_call_id, should_end_call, barge_in_allowed, welcome_in_progress
             try:
                 async for message in websocket.iter_text():
                     data = json.loads(message)
@@ -504,6 +577,9 @@ async def handle_media_stream_with_agent(websocket: WebSocket, agent_id: str):
                                     "instructions": f"Greet the user by saying exactly: {agent_welcome}"
                                 }
                             }))
+                            # Disable barge-in until welcome finishes
+                            welcome_in_progress = True
+                            barge_in_allowed = False
                     elif data['event'] == 'stop':
                         # Call ending
                         print(f"Stream stopped {stream_sid}")
@@ -521,9 +597,14 @@ async def handle_media_stream_with_agent(websocket: WebSocket, agent_id: str):
                 print("Client disconnected.")
                 if openai_ws.state.name == 'OPEN':
                     await openai_ws.close()
+            except RuntimeError as e:
+                # This can happen if the websocket is closed by the other task while we're awaiting reads
+                print(f"Receive loop ended due to runtime error: {e}")
+                with contextlib.suppress(Exception):
+                    await openai_ws.close()
         async def send_to_twilio():
             """Receive events from the OpenAI Realtime API, send audio back to Twilio."""
-            nonlocal stream_sid, is_user_speaking, current_user_buffer
+            nonlocal stream_sid, is_user_speaking, current_user_buffer, should_end_call, barge_in_allowed, welcome_in_progress, goodbye_audio_bytes, call_ended_monotonic
             try:
                 async for openai_message in openai_ws:
                     response = json.loads(openai_message)
@@ -533,20 +614,24 @@ async def handle_media_stream_with_agent(websocket: WebSocket, agent_id: str):
                         print("Session updated successfully:", response)
 
                     if response['type'] == 'input_audio_buffer.speech_started':
-                        # Begin capturing a user utterance
-                        is_user_speaking = True
-                        current_user_buffer = bytearray()
-                        # Clear Twilio's audio buffer
-                        clear_message = {
-                            "event": "clear",
-                            "streamSid": stream_sid
-                        }
-                        await websocket.send_json(clear_message)
-                        # Cancel OpenAI's response
-                        cancel_message = {
-                            "type": "response.cancel"
-                        }
-                        await openai_ws.send(json.dumps(cancel_message)) 
+                        if not barge_in_allowed:
+                            # Ignore barge-in while welcome is playing
+                            print("Barge-in disabled during welcome; ignoring user speech start.")
+                        else:
+                            # Begin capturing a user utterance and interrupt assistant
+                            is_user_speaking = True
+                            current_user_buffer = bytearray()
+                            # Clear Twilio's audio buffer
+                            clear_message = {
+                                "event": "clear",
+                                "streamSid": stream_sid
+                            }
+                            await websocket.send_json(clear_message)
+                            # Cancel OpenAI's response
+                            cancel_message = {
+                                "type": "response.cancel"
+                            }
+                            await openai_ws.send(json.dumps(cancel_message)) 
 
                     if response['type'] == 'input_audio_buffer.speech_stopped':
                         # Finish capturing the current user utterance
@@ -561,7 +646,10 @@ async def handle_media_stream_with_agent(websocket: WebSocket, agent_id: str):
                     if response['type'] == 'response.output_audio.delta' and response.get('delta'):
                         # Audio from OpenAI
                         try:
-                            audio_payload = base64.b64encode(base64.b64decode(response['delta'])).decode('utf-8')
+                            raw = base64.b64decode(response['delta'])
+                            if should_end_call:
+                                goodbye_audio_bytes += len(raw)
+                            audio_payload = base64.b64encode(raw).decode('utf-8')
                             audio_delta = {
                                 "event": "media",
                                 "streamSid": stream_sid,
@@ -574,6 +662,27 @@ async def handle_media_stream_with_agent(websocket: WebSocket, agent_id: str):
                             print(f"Error processing audio data: {e}")
                     # Detect function calling and queue tools; also capture assistant text
                     if response.get('type') == 'response.done':
+                        # If we were asked to end the call, wait for the goodbye audio playout time
+                        if should_end_call:
+                            status = (response.get('response') or {}).get('status')
+                            if status == 'completed':
+                                # u-law PCMU is 8000 bytes/sec; add small safety margin + extra 1s per request
+                                wait_seconds = min(10.0, (goodbye_audio_bytes / 8000.0) + 0.5)
+                                print(f"Goodbye completed. Waiting {wait_seconds:.2f}s for playout, then hanging up.")
+                                await asyncio.sleep(wait_seconds)
+                                call_ended_monotonic = time.monotonic()
+                                with contextlib.suppress(Exception):
+                                    await websocket.close()
+                                with contextlib.suppress(Exception):
+                                    await openai_ws.close()
+                                return
+                            else:
+                                # Not a completed response (e.g., cancelled by turn_detected). Do not hang up yet.
+                                goodbye_audio_bytes = 0
+                        # Re-enable barge-in once the welcome message has fully completed
+                        if welcome_in_progress:
+                            welcome_in_progress = False
+                            barge_in_allowed = True
                         try:
                             out = response.get('response', {}).get('output', [])
                             # Extract assistant message text/transcript for transcript log
@@ -613,7 +722,10 @@ async def handle_media_stream_with_agent(websocket: WebSocket, agent_id: str):
             except Exception as e:
                 print(f"Error in send_to_twilio: {e}")
         try:
+            # Guard against exceptions bubbling up; we'll still run cleanup in finally
             await asyncio.gather(receive_from_twilio(), send_to_twilio())
+        except Exception as e:
+            print(f"Error during media loop: {e}")
         finally:
             # Stop worker gracefully
             try:
@@ -622,6 +734,17 @@ async def handle_media_stream_with_agent(websocket: WebSocket, agent_id: str):
                 pass
             with contextlib.suppress(asyncio.CancelledError):
                 await worker_task
+            
+            # Ensure websockets are closed
+            try:
+                await openai_ws.close()
+            except Exception:
+                pass
+            try:
+                await websocket.close()
+            except Exception:
+                pass
+                
             # After call ends, assemble transcript and update DB
             await process_post_call(
                 conversation=conversation,
@@ -717,6 +840,25 @@ async def send_session_update(openai_ws, instructions):
                             }
                         },
                         "required": ["meeting_name", "meeting_time"]
+                    }
+                },
+                {
+                    "type": "function",
+                    "name": "end_call",
+                    "description": "End the call when the caller is trying to sell something. First record what they're trying to sell, say thank you, then end the call politely. Also accepts a short summary text for follow-up email which will include the caller's phone number.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "sales_item": {
+                                "type": "string",
+                                "description": "Description of what the caller is trying to sell"
+                            },
+                            "summary": {
+                                "type": "string",
+                                "description": "Short summary of the sales inquiry to email after call"
+                            }
+                        },
+                        "required": []
                     }
                 }
             ],
