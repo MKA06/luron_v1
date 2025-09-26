@@ -361,6 +361,13 @@ async def handle_agent_call(agent_id: str, request: Request):
 
     response = VoiceResponse()
 
+    # Say the welcome message first using Google voice, before connecting to media stream
+    if agent_welcome:
+        response.say(
+            agent_welcome,
+            voice="Google.en-US-Chirp3-HD-Aoede"
+        )
+
     host = request.url.hostname
     connect = Connect()
 
@@ -405,9 +412,6 @@ async def handle_media_stream_with_agent(websocket: WebSocket, agent_id: str):
         twilio_call_sid: Optional[str] = None
         should_end_call: bool = False  # Flag to signal call termination
         goodbye_audio_bytes: int = 0    # Bytes of goodbye audio sent after end_call
-        # Control barge-in behavior around the welcome message
-        barge_in_allowed: bool = True
-        welcome_in_progress: bool = False
 
         async def tool_worker():
             nonlocal websocket, should_end_call, goodbye_audio_bytes  # Add needed nonlocals
@@ -533,7 +537,7 @@ async def handle_media_stream_with_agent(websocket: WebSocket, agent_id: str):
         stream_sid = None
         async def receive_from_twilio():
             """Receive audio data from Twilio and send it to the OpenAI Realtime API."""
-            nonlocal stream_sid, is_user_speaking, current_user_buffer, call_started_monotonic, call_ended_monotonic, twilio_call_sid, db_call_id, should_end_call, barge_in_allowed, welcome_in_progress
+            nonlocal stream_sid, is_user_speaking, current_user_buffer, call_started_monotonic, call_ended_monotonic, twilio_call_sid, db_call_id, should_end_call
             try:
                 async for message in websocket.iter_text():
                     data = json.loads(message)
@@ -570,17 +574,7 @@ async def handle_media_stream_with_agent(websocket: WebSocket, agent_id: str):
                             pass
                         if call_started_monotonic is None:
                             call_started_monotonic = time.monotonic()
-                        # Send welcome message
-                        if agent_welcome:
-                            await openai_ws.send(json.dumps({
-                                "type": "response.create",
-                                "response": {
-                                    "instructions": f"Greet the user by saying exactly: {agent_welcome}"
-                                }
-                            }))
-                            # Disable barge-in until welcome finishes
-                            welcome_in_progress = True
-                            barge_in_allowed = False
+                        # Welcome message is now handled by Twilio's .say() before connecting
                     elif data['event'] == 'stop':
                         # Call ending
                         print(f"Stream stopped {stream_sid}")
@@ -605,7 +599,7 @@ async def handle_media_stream_with_agent(websocket: WebSocket, agent_id: str):
                     await openai_ws.close()
         async def send_to_twilio():
             """Receive events from the OpenAI Realtime API, send audio back to Twilio."""
-            nonlocal stream_sid, is_user_speaking, current_user_buffer, should_end_call, barge_in_allowed, welcome_in_progress, goodbye_audio_bytes, call_ended_monotonic
+            nonlocal stream_sid, is_user_speaking, current_user_buffer, should_end_call, goodbye_audio_bytes, call_ended_monotonic
             try:
                 async for openai_message in openai_ws:
                     response = json.loads(openai_message)
@@ -615,24 +609,20 @@ async def handle_media_stream_with_agent(websocket: WebSocket, agent_id: str):
                         print("Session updated successfully:", response)
 
                     if response['type'] == 'input_audio_buffer.speech_started':
-                        if not barge_in_allowed:
-                            # Ignore barge-in while welcome is playing
-                            print("Barge-in disabled during welcome; ignoring user speech start.")
-                        else:
-                            # Begin capturing a user utterance and interrupt assistant
-                            is_user_speaking = True
-                            current_user_buffer = bytearray()
-                            # Clear Twilio's audio buffer
-                            clear_message = {
-                                "event": "clear",
-                                "streamSid": stream_sid
-                            }
-                            await websocket.send_json(clear_message)
-                            # Cancel OpenAI's response
-                            cancel_message = {
-                                "type": "response.cancel"
-                            }
-                            await openai_ws.send(json.dumps(cancel_message)) 
+                        # Begin capturing a user utterance and interrupt assistant
+                        is_user_speaking = True
+                        current_user_buffer = bytearray()
+                        # Clear Twilio's audio buffer
+                        clear_message = {
+                            "event": "clear",
+                            "streamSid": stream_sid
+                        }
+                        await websocket.send_json(clear_message)
+                        # Cancel OpenAI's response
+                        cancel_message = {
+                            "type": "response.cancel"
+                        }
+                        await openai_ws.send(json.dumps(cancel_message)) 
 
                     if response['type'] == 'input_audio_buffer.speech_stopped':
                         # Finish capturing the current user utterance
@@ -680,10 +670,6 @@ async def handle_media_stream_with_agent(websocket: WebSocket, agent_id: str):
                             else:
                                 # Not a completed response (e.g., cancelled by turn_detected). Do not hang up yet.
                                 goodbye_audio_bytes = 0
-                        # Re-enable barge-in once the welcome message has fully completed
-                        if welcome_in_progress:
-                            welcome_in_progress = False
-                            barge_in_allowed = True
                         try:
                             out = response.get('response', {}).get('output', [])
                             # Extract assistant message text/transcript for transcript log
