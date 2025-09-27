@@ -911,7 +911,7 @@ async def send_session_update(openai_ws, instructions, agent_id=None, welcome_me
                     "voice": VOICE
                 }
             },
-            "instructions": instructions + (f"\n\nIMPORTANT: You have already greeted the caller with: '{welcome_message}'. Do not repeat this greeting or say welcome again." if welcome_message else ""),
+            "instructions": instructions + "\n\nCRITICAL RULES:\n1. NEVER greet the caller - no 'hello', 'hi', 'welcome', or any greeting words.\n2. The caller has already been greeted by the system.\n3. Wait for the caller to speak first.\n4. Only respond to what the caller says - do not initiate conversation.\n5. If the caller greets you, acknowledge briefly without greeting back (e.g., 'How can I help you?' instead of 'Hello').",
             # Configure function calling tools at the session level
             "tools": tools,
             "tool_choice": "auto",
