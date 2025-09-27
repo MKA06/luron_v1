@@ -456,8 +456,14 @@ async def handle_media_stream_with_agent(websocket: WebSocket, agent_id: str):
         tool_queue: "asyncio.Queue[Dict[str, Any]]" = asyncio.Queue()
         # Buffer inbound Twilio audio (PCMU/u-law) for post-call transcription
         ulaw_chunks: list[bytes] = []
-        # Conversation capture
+        # Conversation capture - Initialize with welcome message if present
         conversation: list[dict] = []  # sequence of {role: 'user'|'assistant', text?: str, audio_bytes?: bytes}
+        # Add the welcome message to conversation history so AI doesn't repeat it
+        if agent_welcome:
+            conversation.append({
+                "role": "assistant",
+                "text": agent_welcome
+            })
         is_user_speaking: bool = False
         current_user_buffer: bytearray = bytearray()
         call_started_monotonic: Optional[float] = None
@@ -587,7 +593,7 @@ async def handle_media_stream_with_agent(websocket: WebSocket, agent_id: str):
 
         worker_task = asyncio.create_task(tool_worker())
 
-        await send_session_update(openai_ws, agent_prompt, agent_id)
+        await send_session_update(openai_ws, agent_prompt, agent_id, agent_welcome)
         stream_sid = None
         async def receive_from_twilio():
             """Receive audio data from Twilio and send it to the OpenAI Realtime API."""
@@ -798,7 +804,7 @@ async def handle_media_stream_with_agent(websocket: WebSocket, agent_id: str):
 
 
 
-async def send_session_update(openai_ws, instructions, agent_id=None):
+async def send_session_update(openai_ws, instructions, agent_id=None, welcome_message=None):
     """Send session update to OpenAI WebSocket."""
     # Only include tools for the specific agent ID
     tools = []
@@ -905,7 +911,7 @@ async def send_session_update(openai_ws, instructions, agent_id=None):
                     "voice": VOICE
                 }
             },
-            "instructions": instructions,
+            "instructions": instructions + (f"\n\nIMPORTANT: You have already greeted the caller with: '{welcome_message}'. Do not repeat this greeting or say welcome again." if welcome_message else ""),
             # Configure function calling tools at the session level
             "tools": tools,
             "tool_choice": "auto",
