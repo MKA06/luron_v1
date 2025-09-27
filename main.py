@@ -17,6 +17,7 @@ from dotenv import load_dotenv
 from supabase import create_client, Client
 from openai import OpenAI
 from post_call import process_post_call
+from langdetect import detect, LangDetectException
 
 load_dotenv()
 # Configuration
@@ -24,6 +25,57 @@ OPENAI_API_KEY = os.getenv('OPENAI_API_KEY') # requires OpenAI Realtime API Acce
 PORT = int(os.getenv('PORT', 8000))
 VOICE = 'shimmer'
 openai_client = OpenAI()
+
+# Voice mappings for different languages
+# Using Google Chirp3-HD voices for best quality, fallback to Polly for wider language support
+VOICE_MAPPINGS = {
+    'en': 'Google.en-US-Chirp3-HD-Aoede',  # English
+    'es': 'Google.es-ES-Neural2-A',        # Spanish
+    'fr': 'Google.fr-FR-Neural2-A',        # French
+    'de': 'Google.de-DE-Neural2-A',        # German
+    'it': 'Google.it-IT-Neural2-A',        # Italian
+    'pt': 'Google.pt-BR-Neural2-A',        # Portuguese
+    'nl': 'Google.nl-NL-Neural2-A',        # Dutch
+    'ja': 'Google.ja-JP-Neural2-A',        # Japanese
+    'ko': 'Google.ko-KR-Neural2-A',        # Korean
+    'zh': 'Google.cmn-CN-Neural2-A',       # Chinese (Simplified)
+    'ru': 'Google.ru-RU-Neural2-A',        # Russian
+    'ar': 'Google.ar-XA-Neural2-A',        # Arabic
+    'hi': 'Google.hi-IN-Neural2-A',        # Hindi
+    'tr': 'Google.tr-TR-Chirp3-HD-Aoede',        # Turkish (Google's female voice)
+    'pl': 'Google.pl-PL-Neural2-A',        # Polish
+    'sv': 'Google.sv-SE-Neural2-A',        # Swedish
+    'da': 'Google.da-DK-Neural2-A',        # Danish
+    'no': 'Google.nb-NO-Neural2-A',        # Norwegian
+    'fi': 'Google.fi-FI-Neural2-A',        # Finnish
+    'he': 'Google.he-IL-Neural2-A',        # Hebrew
+    'id': 'Google.id-ID-Neural2-A',        # Indonesian
+    'th': 'Google.th-TH-Neural2-A',        # Thai
+    'vi': 'Google.vi-VN-Neural2-A',        # Vietnamese
+    'default': 'Google.en-US-Chirp3-HD-Aoede'  # Default to English if language not detected
+}
+
+def get_voice_for_text(text: str) -> str:
+    """
+    Detect the language of the text and return the appropriate voice.
+    Falls back to English voice if detection fails.
+    """
+    try:
+        # Detect language
+        detected_lang = detect(text)
+
+        # Get the appropriate voice for the detected language
+        voice = VOICE_MAPPINGS.get(detected_lang, VOICE_MAPPINGS['default'])
+
+        print(f"Detected language: {detected_lang}, using voice: {voice}")
+        return voice
+
+    except LangDetectException as e:
+        print(f"Language detection failed: {e}, using default voice")
+        return VOICE_MAPPINGS['default']
+    except Exception as e:
+        print(f"Error in voice selection: {e}, using default voice")
+        return VOICE_MAPPINGS['default']
 
 # Google OAuth Configuration - YOUR app's credentials
 GOOGLE_CLIENT_ID = os.getenv('GOOGLE_OAUTH_CLIENT_ID')
@@ -361,11 +413,13 @@ async def handle_agent_call(agent_id: str, request: Request):
 
     response = VoiceResponse()
 
-    # Say the welcome message first using Google voice, before connecting to media stream
+    # Say the welcome message first using appropriate multilingual voice
     if agent_welcome:
+        # Detect language and select appropriate voice
+        voice = get_voice_for_text(agent_welcome)
         response.say(
             agent_welcome,
-            voice="Google.en-US-Chirp3-HD-Aoede"
+            voice=voice
         )
 
     host = request.url.hostname
