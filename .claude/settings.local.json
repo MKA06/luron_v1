@@ -5,7 +5,10 @@
       "WebSearch",
       "WebFetch(domain:community.openai.com)",
       "Bash(pip install:*)",
-      "Bash(python:*)"
+      "Bash(python:*)",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:www.assemblyai.com)",
+      "Bash(python3:*)"
     ],
     "deny": [],
     "ask": []

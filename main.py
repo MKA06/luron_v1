@@ -84,6 +84,8 @@ GOOGLE_CLIENT_SECRET = os.getenv('GOOGLE_OAUTH_CLIENT_SECRET')
 # Supabase configuration
 SUPABASE_URL = os.getenv('SUPABASE_URL')
 SUPABASE_KEY = os.getenv('SUPABASE_KEY')
+if not SUPABASE_URL or not SUPABASE_KEY:
+    raise ValueError('Missing Supabase credentials. Please set SUPABASE_URL and SUPABASE_KEY in the .env file.')
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 async def weather():
@@ -125,10 +127,13 @@ if not OPENAI_API_KEY:
 
 # Include outbound call routes if available
 try:
-    from outbound import router as outbound_router
-    app.include_router(outbound_router)
-except Exception:
-    pass
+    from outbound import app as outbound_app
+    # Mount the outbound app at a prefix
+    app.mount("/outbound", outbound_app)
+except ImportError:
+    print("Outbound app not available")
+except Exception as e:
+    print(f"Error loading outbound app: {e}")
 
 # Google OAuth credential intake endpoint
 
@@ -274,12 +279,12 @@ async def get_weather():
     print("HEY HEY HEY WHAT'S HAPPENING YOUTUBE")
     return "The weather right now is sunny"
 
-async def set_meeting(user_id: str = None,
-                      meeting_name: str = None,
-                      meeting_time: str = None,
+async def set_meeting(user_id: Optional[str] = None,
+                      meeting_name: Optional[str] = None,
+                      meeting_time: Optional[str] = None,
                       duration_minutes: int = 60,
-                      description: str = None,
-                      location: str = None):
+                      description: Optional[str] = None,
+                      location: Optional[str] = None):
     """Schedule a meeting in the user's Google Calendar.
     
     This is a wrapper function that calls the actual implementation in gcal.py.
@@ -296,18 +301,27 @@ async def set_meeting(user_id: str = None,
         A formatted string with meeting creation status
     """
     from gcal import set_meeting as gcal_set_meeting
+    
+    # Validate required parameters
+    if not user_id:
+        raise ValueError("user_id is required")
+    if not meeting_name:
+        raise ValueError("meeting_name is required")
+    if not meeting_time:
+        raise ValueError("meeting_time is required")
+    
     return await gcal_set_meeting(
         supabase=supabase,
         user_id=user_id,
         meeting_name=meeting_name,
         meeting_time=meeting_time,
         duration_minutes=duration_minutes,
-        description=description,
-        location=location
+        description=description or "",
+        location=location or ""
     )
 
 
-async def get_availability(user_id: str = None, days_ahead: int = 7):
+async def get_availability(user_id: Optional[str] = None, days_ahead: int = 7):
     """Get user's calendar availability for agents to use.
     
     This is a wrapper function that calls the actual implementation in gcal.py.
@@ -320,6 +334,11 @@ async def get_availability(user_id: str = None, days_ahead: int = 7):
         A formatted string with availability information
     """
     from gcal import get_availability as gcal_get_availability
+    
+    # Validate required parameters
+    if not user_id:
+        raise ValueError("user_id is required")
+    
     return await gcal_get_availability(
         supabase=supabase,
         user_id=user_id,
@@ -327,7 +346,7 @@ async def get_availability(user_id: str = None, days_ahead: int = 7):
     )
 
 
-async def end_call(sales_item: str = None, summary: str = None, caller_number: str = None):
+async def end_call(sales_item: Optional[str] = None, summary: Optional[str] = None, caller_number: Optional[str] = None):
     """End the call after recording what the caller is trying to sell.
 
     This function is used when the caller is identified as trying to sell something.
@@ -448,12 +467,12 @@ async def handle_media_stream_with_agent(websocket: WebSocket, agent_id: str):
 
     async with websockets.connect(
          f"wss://api.openai.com/v1/realtime?model=gpt-realtime&temperature={TEMPERATURE}",
-    additional_headers={
+         additional_headers={
             "Authorization": f"Bearer {OPENAI_API_KEY}"
         }
     ) as openai_ws:
         # Per-connection tool queue and worker
-        tool_queue: "asyncio.Queue[Dict[str, Any]]" = asyncio.Queue()
+        tool_queue: "asyncio.Queue[Optional[Dict[str, Any]]]" = asyncio.Queue()
         # Buffer inbound Twilio audio (PCMU/u-law) for post-call transcription
         ulaw_chunks: list[bytes] = []
         # Conversation capture - Initialize with welcome message if present
@@ -498,11 +517,14 @@ async def handle_media_stream_with_agent(websocket: WebSocket, agent_id: str):
                                 user_id = agent_result.data.get('user_id')
 
                         days_ahead = args.get("days_ahead", 7)
-                        result = await get_availability(
-                            user_id=user_id,
-                            days_ahead=days_ahead
-                        )
-                        output_obj = {"availability": result}
+                        if not user_id:
+                            output_obj = {"error": "user_id is required for availability check"}
+                        else:
+                            result = await get_availability(
+                                user_id=user_id,
+                                days_ahead=days_ahead
+                            )
+                            output_obj = {"availability": result}
                     elif name == "set_meeting":
                         # Get user_id from agent's user_id
                         user_id = args.get("user_id")
@@ -518,15 +540,22 @@ async def handle_media_stream_with_agent(websocket: WebSocket, agent_id: str):
                         description = args.get("description")
                         location = args.get("location")
 
-                        result = await set_meeting(
-                            user_id=user_id,
-                            meeting_name=meeting_name,
-                            meeting_time=meeting_time,
-                            duration_minutes=duration_minutes,
-                            description=description,
-                            location=location
-                        )
-                        output_obj = {"meeting": result}
+                        if not user_id:
+                            output_obj = {"error": "user_id is required for meeting scheduling"}
+                        elif not meeting_name:
+                            output_obj = {"error": "meeting_name is required"}
+                        elif not meeting_time:
+                            output_obj = {"error": "meeting_time is required"}
+                        else:
+                            result = await set_meeting(
+                                user_id=user_id,
+                                meeting_name=meeting_name,
+                                meeting_time=meeting_time,
+                                duration_minutes=duration_minutes,
+                                description=description,
+                                location=location
+                            )
+                            output_obj = {"meeting": result}
                     elif name == "end_call":
                         # Get sales_item from arguments
                         sales_item = args.get("sales_item")
@@ -540,7 +569,11 @@ async def handle_media_stream_with_agent(websocket: WebSocket, agent_id: str):
                                     caller_number = lookup.data.get('from_number')
                             except Exception as e:
                                 print(f"Failed to get caller number: {e}")
-                        result = await end_call(sales_item=sales_item, summary=summary, caller_number=caller_number)
+                        result = await end_call(
+                            sales_item=sales_item or "",
+                            summary=summary or "",
+                            caller_number=caller_number or ""
+                        )
                         
                         # If this is the end call signal, we need to close the connection
                         if result == "END_CALL_SIGNAL":
@@ -776,7 +809,7 @@ async def handle_media_stream_with_agent(websocket: WebSocket, agent_id: str):
         finally:
             # Stop worker gracefully
             try:
-                await tool_queue.put(None)
+                await tool_queue.put(None)  # Signal shutdown
             except Exception:
                 pass
             with contextlib.suppress(asyncio.CancelledError):
