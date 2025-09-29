@@ -45,7 +45,7 @@ async def transcribe_ulaw_to_text(ulaw_bytes: bytes) -> str:
         wav_buffer.seek(0)
         setattr(wav_buffer, 'name', 'utterance.wav')
         result = openai_client.audio.transcriptions.create(
-            model="whisper-1",
+            model="gpt-4o-transcribe",
             file=wav_buffer,
         )
         text = getattr(result, 'text', None) or (result.get('text') if isinstance(result, dict) else None)

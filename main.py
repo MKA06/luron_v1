@@ -18,6 +18,7 @@ from supabase import create_client, Client
 from openai import OpenAI
 from post_call import process_post_call
 from langdetect import detect, LangDetectException
+from call_recording import CallRecorder
 
 load_dotenv()
 # Configuration
@@ -465,6 +466,15 @@ async def handle_media_stream_with_agent(websocket: WebSocket, agent_id: str):
     agent_welcome = agent_data.get('welcome_message')
     print(f"Using agent {agent_id} with custom prompt")
 
+    # Initialize call recorder
+    call_recorder = CallRecorder(
+        supabase=supabase,
+        agent_id=agent_id,
+        call_sid=None  # Will be set when we get stream info
+    )
+    # Remove the queue-based approach - handle audio directly with proper timestamps
+    current_assistant_response_start: Optional[float] = None  # Track when assistant starts speaking
+
     async with websockets.connect(
          f"wss://api.openai.com/v1/realtime?model=gpt-realtime&temperature={TEMPERATURE}",
          additional_headers={
@@ -491,6 +501,7 @@ async def handle_media_stream_with_agent(websocket: WebSocket, agent_id: str):
         twilio_call_sid: Optional[str] = None
         should_end_call: bool = False  # Flag to signal call termination
         goodbye_audio_bytes: int = 0    # Bytes of goodbye audio sent after end_call
+        call_recording_start_time: float = time.time()  # Reference time for recording
 
         async def tool_worker():
             nonlocal websocket, should_end_call, goodbye_audio_bytes  # Add needed nonlocals
@@ -643,6 +654,9 @@ async def handle_media_stream_with_agent(websocket: WebSocket, agent_id: str):
                         try:
                             decoded = base64.b64decode(data['media']['payload'])
                             ulaw_chunks.append(decoded)
+                            # Record user audio with exact timestamp
+                            current_timestamp = time.time() - call_recording_start_time
+                            call_recorder.append_user_audio(decoded, timestamp=current_timestamp)
                             if is_user_speaking:
                                 current_user_buffer.extend(decoded)
                         except Exception:
@@ -654,6 +668,10 @@ async def handle_media_stream_with_agent(websocket: WebSocket, agent_id: str):
                         # Capture CallSid and resolve DB call id for later update
                         try:
                             twilio_call_sid = data['start'].get('callSid')
+                            # Set call_sid for recorder and reset timing
+                            call_recorder.call_sid = twilio_call_sid
+                            call_recording_start_time = time.time()
+                            call_recorder.call_start_time = call_recording_start_time
                             if twilio_call_sid:
                                 try:
                                     lookup = supabase.table('calls').select('id, from_number').eq('twilio_call_sid', twilio_call_sid).eq('agent_id', agent_id).order('created_at', desc=True).limit(1).execute()
@@ -690,9 +708,11 @@ async def handle_media_stream_with_agent(websocket: WebSocket, agent_id: str):
                 print(f"Receive loop ended due to runtime error: {e}")
                 with contextlib.suppress(Exception):
                     await openai_ws.close()
+        # Removed the queue processor - we'll handle audio directly with timestamps
+
         async def send_to_twilio():
             """Receive events from the OpenAI Realtime API, send audio back to Twilio."""
-            nonlocal stream_sid, is_user_speaking, current_user_buffer, should_end_call, goodbye_audio_bytes, call_ended_monotonic
+            nonlocal stream_sid, is_user_speaking, current_user_buffer, should_end_call, goodbye_audio_bytes, call_ended_monotonic, current_assistant_response_start
             try:
                 async for openai_message in openai_ws:
                     response = json.loads(openai_message)
@@ -703,8 +723,16 @@ async def handle_media_stream_with_agent(websocket: WebSocket, agent_id: str):
 
                     if response['type'] == 'input_audio_buffer.speech_started':
                         # Begin capturing a user utterance and interrupt assistant
+                        current_timestamp = time.time() - call_recording_start_time
                         is_user_speaking = True
                         current_user_buffer = bytearray()
+
+                        # IMPORTANT: User barge-in - notify recorder to cut off assistant audio
+                        call_recorder.user_started_speaking(timestamp=current_timestamp)
+
+                        # Reset assistant response tracking when user interrupts
+                        current_assistant_response_start = None
+
                         # Clear Twilio's audio buffer
                         clear_message = {
                             "event": "clear",
@@ -719,6 +747,7 @@ async def handle_media_stream_with_agent(websocket: WebSocket, agent_id: str):
 
                     if response['type'] == 'input_audio_buffer.speech_stopped':
                         # Finish capturing the current user utterance
+                        current_timestamp = time.time() - call_recording_start_time
                         if is_user_speaking and current_user_buffer:
                             conversation.append({
                                 "role": "user",
@@ -726,11 +755,28 @@ async def handle_media_stream_with_agent(websocket: WebSocket, agent_id: str):
                             })
                         is_user_speaking = False
 
+                        # Notify recorder that user stopped speaking
+                        call_recorder.user_stopped_speaking(timestamp=current_timestamp)
+
+                        # Mark that assistant can start a new response
+                        current_assistant_response_start = None
+
                     
                     if response['type'] == 'response.output_audio.delta' and response.get('delta'):
                         # Audio from OpenAI
                         try:
                             raw = base64.b64decode(response['delta'])
+                            current_timestamp = time.time() - call_recording_start_time
+
+                            # Track start of new assistant response
+                            if current_assistant_response_start is None:
+                                current_assistant_response_start = current_timestamp
+                                call_recorder.assistant_started_speaking(timestamp=current_timestamp)
+                                print(f"Assistant starting new turn at {current_timestamp:.2f}s")
+
+                            # Directly append to recorder with exact timestamp
+                            call_recorder.append_assistant_audio(raw, timestamp=current_timestamp)
+
                             if should_end_call:
                                 goodbye_audio_bytes += len(raw)
                             audio_payload = base64.b64encode(raw).decode('utf-8')
@@ -744,6 +790,15 @@ async def handle_media_stream_with_agent(websocket: WebSocket, agent_id: str):
                             await websocket.send_json(audio_delta)
                         except Exception as e:
                             print(f"Error processing audio data: {e}")
+                    # Handle response completion for turn tracking
+                    if response.get('type') == 'response.audio_done':
+                        # Audio response completed - reset for next turn
+                        current_timestamp = time.time() - call_recording_start_time
+                        if current_assistant_response_start is not None:
+                            call_recorder.assistant_stopped_speaking(timestamp=current_timestamp)
+                            print(f"Assistant audio response completed at {current_timestamp:.2f}s")
+                        current_assistant_response_start = None
+
                     # Detect function calling and queue tools; also capture assistant text
                     if response.get('type') == 'response.done':
                         # If we were asked to end the call, wait for the goodbye audio playout time
@@ -807,6 +862,8 @@ async def handle_media_stream_with_agent(websocket: WebSocket, agent_id: str):
         except Exception as e:
             print(f"Error during media loop: {e}")
         finally:
+            # No queue to process anymore - audio is handled directly
+
             # Stop worker gracefully
             try:
                 await tool_queue.put(None)  # Signal shutdown
@@ -825,6 +882,9 @@ async def handle_media_stream_with_agent(websocket: WebSocket, agent_id: str):
             except Exception:
                 pass
                 
+            # Save recording asynchronously (non-blocking)
+            recording_task = asyncio.create_task(call_recorder.save_recording())
+
             # After call ends, assemble transcript and update DB
             await process_post_call(
                 conversation=conversation,
@@ -834,6 +894,19 @@ async def handle_media_stream_with_agent(websocket: WebSocket, agent_id: str):
                 call_started_monotonic=call_started_monotonic,
                 call_ended_monotonic=call_ended_monotonic,
             )
+
+            # Wait for recording to complete and update DB with recording URL
+            try:
+                recording_url = await recording_task
+                if recording_url and db_call_id:
+                    # Update call record with recording URL
+                    supabase.table('calls').update({
+                        'recording_url': recording_url,
+                        'recording_duration': call_recorder.get_duration_seconds()
+                    }).eq('id', db_call_id).execute()
+                    print(f"✅ Recording URL saved to database: {recording_url}")
+            except Exception as e:
+                print(f"❌ Failed to save recording URL: {e}")
 
 
 
