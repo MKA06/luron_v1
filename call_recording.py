@@ -7,7 +7,6 @@ from datetime import datetime
 from typing import List, Optional, Tuple, Dict
 import numpy as np
 from supabase import Client
-import audioop
 
 
 class CallRecorder:
@@ -180,9 +179,9 @@ class CallRecorder:
         # Build properly timed audio tracks
         user_pcmu, assistant_pcmu = self._build_timeline_audio()
 
-        # Decode PCMU to PCM (simple, no processing)
-        user_pcm = audioop.ulaw2lin(user_pcmu, 2)
-        assistant_pcm = audioop.ulaw2lin(assistant_pcmu, 2)
+        # Decode PCMU to PCM using numpy (Python 3.13+ compatible)
+        user_pcm = self._ulaw_to_linear(user_pcmu)
+        assistant_pcm = self._ulaw_to_linear(assistant_pcmu)
 
         # Convert to numpy arrays
         user_samples = np.frombuffer(user_pcm, dtype=np.int16)
@@ -280,6 +279,43 @@ class CallRecorder:
             import traceback
             traceback.print_exc()
             return None
+
+    def _ulaw_to_linear(self, ulaw_bytes: bytes) -> bytes:
+        """Convert u-law encoded audio to 16-bit linear PCM.
+
+        This replaces audioop.ulaw2lin which was removed in Python 3.13.
+        """
+        # u-law decoding table
+        BIAS = 0x84
+        CLIP = 32635
+
+        # Create the decoding table
+        exp_lut = [0, 132, 396, 924, 1980, 4092, 8316, 16764]
+
+        # Convert bytes to numpy array for faster processing
+        ulaw_array = np.frombuffer(ulaw_bytes, dtype=np.uint8)
+        pcm_values = np.zeros(len(ulaw_array), dtype=np.int16)
+
+        for i, ulaw_val in enumerate(ulaw_array):
+            # Complement to get sign and magnitude
+            ulaw_val = ~ulaw_val & 0xFF
+
+            # Extract sign, exponent, and mantissa
+            sign = (ulaw_val & 0x80)
+            exponent = (ulaw_val >> 4) & 0x07
+            mantissa = ulaw_val & 0x0F
+
+            # Compute the linear value
+            sample = exp_lut[exponent] + (mantissa << (exponent + 3))
+
+            # Add sign
+            if sign != 0:
+                sample = -sample
+
+            pcm_values[i] = sample
+
+        # Convert to bytes (16-bit little-endian)
+        return pcm_values.astype('<i2').tobytes()
 
     def get_duration_seconds(self) -> float:
         """Get the duration of the recording in seconds."""
