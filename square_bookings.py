@@ -696,27 +696,37 @@ async def get_square_availability(supabase, user_id: str, days_ahead: int = 7, l
 
         availabilities = availability_response.get('availabilities', [])
 
-        # Format response
-        response = f"📅 Square Booking Availability for next {days_ahead} days:\n\n"
+        # Format response - group by day first
+        # Use Boston/Eastern timezone
+        user_timezone = 'America/New_York'
+        user_tz = pytz.timezone(user_timezone)
 
-        if availabilities:
-            response += f"Found {len(availabilities)} available time slots:\n\n"
+        # Group slots by day
+        from collections import defaultdict
+        slots_by_day = defaultdict(list)
 
-            # Group by date
-            user_timezone = 'America/Los_Angeles'  # Default, can be customized
-            user_tz = pytz.timezone(user_timezone)
+        for slot in availabilities:
+            start_at = datetime.fromisoformat(slot['start_at'].replace('Z', '+00:00'))
+            start_local = start_at.astimezone(user_tz)
+            day_key = start_local.strftime('%A, %B %d, %Y')  # Full date for clarity
+            time_str = start_local.strftime('%I:%M %p')
+            slots_by_day[day_key].append(time_str)
 
-            current_day = None
-            for slot in availabilities[:20]:  # Limit to first 20
-                start_at = datetime.fromisoformat(slot['start_at'].replace('Z', '+00:00'))
-                start_local = start_at.astimezone(user_tz)
+        # Build response with clear day headers
+        response = f"Available appointment times for the next {days_ahead} days:\n\n"
 
-                day_str = start_local.strftime('%A, %B %d')
-                if day_str != current_day:
-                    current_day = day_str
-                    response += f"\n{day_str}:\n"
+        if slots_by_day:
+            response += f"Total: {len(availabilities)} available slots across {len(slots_by_day)} days\n\n"
 
-                response += f"  - {start_local.strftime('%I:%M %p')}\n"
+            # Sort by date and display
+            sorted_days = sorted(slots_by_day.keys(), key=lambda x: datetime.strptime(x, '%A, %B %d, %Y'))
+
+            for day in sorted_days:
+                times = slots_by_day[day]
+                response += f"**{day}** ({len(times)} slots):\n"
+                for time in times:
+                    response += f"  • {time}\n"
+                response += "\n"
         else:
             response += "No available slots found in the specified time range.\n"
 
@@ -734,7 +744,72 @@ async def get_square_availability(supabase, user_id: str, days_ahead: int = 7, l
         return error_msg
 
 
+def parse_natural_date(booking_time: str, user_tz: pytz.tzinfo) -> datetime:
+    """Parse natural language dates like 'tomorrow at 2pm', 'next Thursday at 3pm', etc.
+
+    Args:
+        booking_time: Natural language time string
+        user_tz: User's timezone
+
+    Returns:
+        Parsed datetime in user's timezone
+    """
+    import re
+
+    now_local = datetime.now(user_tz)
+    booking_time_lower = booking_time.lower().strip()
+
+    # Handle "tomorrow"
+    if booking_time_lower.startswith('tomorrow'):
+        # Extract time portion (e.g., "at 2pm" or "2pm")
+        time_match = re.search(r'(?:at\s+)?(\d{1,2}(?::\d{2})?\s*(?:am|pm))', booking_time_lower)
+        if time_match:
+            time_str = time_match.group(1)
+            # Parse just the time
+            time_obj = parser.parse(time_str)
+            # Add one day to current date
+            tomorrow = now_local + timedelta(days=1)
+            parsed_time = tomorrow.replace(hour=time_obj.hour, minute=time_obj.minute, second=0, microsecond=0)
+        else:
+            # Just "tomorrow" without time
+            parsed_time = now_local + timedelta(days=1)
+
+    # Handle "today"
+    elif booking_time_lower.startswith('today'):
+        time_match = re.search(r'(?:at\s+)?(\d{1,2}(?::\d{2})?\s*(?:am|pm))', booking_time_lower)
+        if time_match:
+            time_str = time_match.group(1)
+            time_obj = parser.parse(time_str)
+            parsed_time = now_local.replace(hour=time_obj.hour, minute=time_obj.minute, second=0, microsecond=0)
+        else:
+            parsed_time = now_local
+
+    # Handle "next [weekday]"
+    elif booking_time_lower.startswith('next'):
+        # Try to parse the whole thing with dateutil
+        try:
+            parsed_time = parser.parse(booking_time, default=now_local, fuzzy=True)
+            # If the parsed time is in the past, add 7 days
+            if parsed_time < now_local:
+                parsed_time = parsed_time + timedelta(days=7)
+        except:
+            parsed_time = parser.parse(booking_time, default=now_local)
+
+    # Try regular parsing for other formats
+    else:
+        parsed_time = parser.parse(booking_time, default=now_local, fuzzy=True)
+
+    # Ensure timezone-aware
+    if parsed_time.tzinfo is None:
+        parsed_time = user_tz.localize(parsed_time)
+
+    return parsed_time
+
+
 async def create_square_booking(supabase, user_id: str, booking_time: str,
+                               customer_name: Optional[str] = None,
+                               customer_phone: Optional[str] = None,
+                               customer_email: Optional[str] = None,
                                customer_note: Optional[str] = None,
                                location_id: Optional[str] = None):
     """Create a Square booking for agents to use.
@@ -743,6 +818,9 @@ async def create_square_booking(supabase, user_id: str, booking_time: str,
         supabase: Supabase client instance
         user_id: The user ID whose Square account to use
         booking_time: ISO format datetime string or natural language time
+        customer_name: Optional customer name (e.g., "John Smith")
+        customer_phone: Optional customer phone number
+        customer_email: Optional customer email address
         customer_note: Optional note for the booking
         location_id: Optional specific location ID
 
@@ -780,29 +858,88 @@ async def create_square_booking(supabase, user_id: str, booking_time: str,
         if not service_id:
             return "Error: No bookable services found. Please create services in your Square Dashboard under Appointments > Services"
 
-        # Parse booking time
-        user_timezone = 'America/Los_Angeles'
+        # Parse booking time using improved natural language parser
+        # Use Boston/Eastern timezone
+        user_timezone = 'America/New_York'
         user_tz = pytz.timezone(user_timezone)
-        now_local = datetime.now(user_tz)
 
-        parsed_time = parser.parse(booking_time, default=now_local)
-        if parsed_time.tzinfo is None:
-            parsed_time = user_tz.localize(parsed_time)
-
+        parsed_time = parse_natural_date(booking_time, user_tz)
         start_at = parsed_time.astimezone(pytz.UTC)
 
-        # Build appointment segment for the service
-        appointment_segments = [{
-            "service_variation_id": service_id,
-            "service_variation_version": 1  # Square requires version number
-        }]
+        print(f"Parsed booking time: {parsed_time} (local) -> {start_at} (UTC)")
+
+        # Search for availability at the requested time to get proper appointment segments
+        # Search in a 2-hour window around the requested time
+        search_start = start_at - timedelta(minutes=30)
+        search_end = start_at + timedelta(hours=1, minutes=30)
+
+        segment_filter = {
+            "service_variation_id": service_id
+        }
+
+        print(f"Searching availability from {search_start} to {search_end}")
+
+        availability_response = search_availability(
+            access_token=access_token,
+            location_id=location_id,
+            start_at_min=search_start,
+            start_at_max=search_end,
+            segment_filters=segment_filter
+        )
+
+        availabilities = availability_response.get('availabilities', [])
+        print(f"Found {len(availabilities)} available slots")
+
+        # Find the slot that matches our requested time (within 5 minutes)
+        matching_slot = None
+        for slot in availabilities:
+            slot_time = datetime.fromisoformat(slot['start_at'].replace('Z', '+00:00'))
+            time_diff = abs((slot_time - start_at).total_seconds())
+            if time_diff < 300:  # Within 5 minutes
+                matching_slot = slot
+                print(f"Found matching slot at {slot_time}")
+                break
+
+        if not matching_slot:
+            return f"Error: The requested time {parsed_time.strftime('%A, %B %d at %I:%M %p')} is not available. Please check availability first and choose an available time slot."
+
+        # Use appointment segments from the availability response
+        appointment_segments = matching_slot.get('appointment_segments', [])
+        if not appointment_segments:
+            # Fallback if no segments in response
+            appointment_segments = [{
+                "service_variation_id": service_id,
+                "service_variation_version": 1
+            }]
+
+        # Use the exact time from the availability slot
+        start_at = datetime.fromisoformat(matching_slot['start_at'].replace('Z', '+00:00'))
+
+        # Parse customer name into first and last name
+        given_name = 'Guest'
+        family_name = 'Customer'
+        if customer_name:
+            name_parts = customer_name.strip().split(None, 1)  # Split on first space
+            if len(name_parts) == 1:
+                given_name = name_parts[0]
+            elif len(name_parts) >= 2:
+                given_name = name_parts[0]
+                family_name = name_parts[1]
 
         # Create customer info for auto-creation (will be used if no customer_id)
         customer_info = {
-            'given_name': 'Guest',
-            'family_name': 'Customer',
-            'note': 'Auto-created by Luron AI booking system'
+            'given_name': given_name,
+            'family_name': family_name,
+            'note': 'Auto-created via phone booking system'
         }
+
+        # Add optional contact info
+        if customer_email:
+            customer_info['email_address'] = customer_email
+        if customer_phone:
+            customer_info['phone_number'] = customer_phone
+
+        print(f"Creating booking with segments: {appointment_segments}")
 
         # Create booking (will auto-create customer if needed)
         booking_response = create_booking(
@@ -822,8 +959,10 @@ async def create_square_booking(supabase, user_id: str, booking_time: str,
         }).eq('user_id', user_id).execute()
 
         response = f"✅ Square booking created successfully!\n\n"
-        response += f"🆔 Booking ID: {booking.get('id', 'N/A')}\n"
+        if customer_name:
+            response += f"👤 Customer: {customer_name}\n"
         response += f"🕐 Time: {parsed_time.strftime('%A, %B %d at %I:%M %p')}\n"
+        response += f"🆔 Booking ID: {booking.get('id', 'N/A')}\n"
         if customer_note:
             response += f"📝 Note: {customer_note}\n"
 
@@ -876,15 +1015,12 @@ async def reschedule_square_booking(supabase, user_id: str, booking_id: str, new
         if not version:
             return "Error: Could not retrieve booking version"
 
-        # Parse new time
-        user_timezone = 'America/Los_Angeles'
+        # Parse new time using improved natural language parser
+        # Use Boston/Eastern timezone
+        user_timezone = 'America/New_York'
         user_tz = pytz.timezone(user_timezone)
-        now_local = datetime.now(user_tz)
 
-        parsed_time = parser.parse(new_time, default=now_local)
-        if parsed_time.tzinfo is None:
-            parsed_time = user_tz.localize(parsed_time)
-
+        parsed_time = parse_natural_date(new_time, user_tz)
         start_at = parsed_time.astimezone(pytz.UTC)
 
         # Update booking

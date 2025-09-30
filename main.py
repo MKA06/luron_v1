@@ -943,6 +943,74 @@ async def handle_media_stream_with_agent(websocket: WebSocket, agent_id: str):
                                 location=location
                             )
                             output_obj = {"meeting": result}
+                    elif name == "get_square_availability":
+                        # Get user_id from agent's user_id
+                        user_id = args.get("user_id")
+                        if not user_id:
+                            # Try to get from agent's owner
+                            agent_result = supabase.table('agents').select('user_id').eq('id', agent_id).single().execute()
+                            if agent_result.data:
+                                user_id = agent_result.data.get('user_id')
+
+                        days_ahead = args.get("days_ahead", 7)
+                        location_id = args.get("location_id")
+
+                        if not user_id:
+                            output_obj = {"error": "user_id is required for availability check"}
+                        else:
+                            from square_bookings import get_square_availability
+                            result = await get_square_availability(
+                                supabase=supabase,
+                                user_id=user_id,
+                                days_ahead=days_ahead,
+                                location_id=location_id
+                            )
+                            output_obj = {"availability": result}
+                    elif name == "create_square_booking":
+                        # Get user_id from agent's user_id
+                        user_id = args.get("user_id")
+                        if not user_id:
+                            # Try to get from agent's owner
+                            agent_result = supabase.table('agents').select('user_id').eq('id', agent_id).single().execute()
+                            if agent_result.data:
+                                user_id = agent_result.data.get('user_id')
+
+                        booking_time = args.get("booking_time")
+                        customer_name = args.get("customer_name")
+                        customer_phone = args.get("customer_phone")
+                        customer_email = args.get("customer_email")
+                        customer_note = args.get("customer_note")
+                        location_id = args.get("location_id")
+
+                        # Auto-add caller's phone number if not provided
+                        if not customer_phone and db_call_id:
+                            try:
+                                call_lookup = supabase.table('calls').select('from_number').eq('id', db_call_id).single().execute()
+                                if call_lookup.data:
+                                    caller_number = call_lookup.data.get('from_number')
+                                    if caller_number:
+                                        customer_phone = caller_number
+                                        print(f"Auto-added caller's phone number: {customer_phone}")
+                            except Exception as e:
+                                print(f"Could not fetch caller number: {e}")
+
+                        if not user_id:
+                            output_obj = {"error": "user_id is required for booking creation"}
+                        elif not booking_time:
+                            output_obj = {"error": "booking_time is required"}
+                        else:
+                            from square_bookings import create_square_booking
+                            result = await create_square_booking(
+                                supabase=supabase,
+                                user_id=user_id,
+                                booking_time=booking_time,
+                                customer_name=customer_name,
+                                customer_phone=customer_phone,
+                                customer_email=customer_email,
+                                customer_note=customer_note,
+                                location_id=location_id
+                            )
+                            output_obj = {"booking": result}
                     elif name == "end_call":
                         # Get sales_item from arguments
                         sales_item = args.get("sales_item")
@@ -961,12 +1029,12 @@ async def handle_media_stream_with_agent(websocket: WebSocket, agent_id: str):
                             summary=summary or "",
                             caller_number=caller_number or ""
                         )
-                        
+
                         # If this is the end call signal, we need to close the connection
                         if result == "END_CALL_SIGNAL":
                             # Send a final message before closing
                             output_obj = {"message": "Thank you for your time. Have a great day!"}
-                            
+
                             # Set the flag to end the call
                             should_end_call = True
                             goodbye_audio_bytes = 0
@@ -1288,10 +1356,93 @@ async def handle_media_stream_with_agent(websocket: WebSocket, agent_id: str):
 
 async def send_session_update(openai_ws, instructions, agent_id=None, welcome_message=None):
     """Send session update to OpenAI WebSocket."""
-    # Only include tools for the specific agent ID
+    # Start with empty tools list
     tools = []
+
+    print("*******************************")
+    print("AGENT ID: ", agent_id)
+
+    # Check if agent has Square enabled
+    agent_has_square = False
+    if agent_id:
+        try:
+            agent_result = supabase.table('agents').select('square').eq('id', agent_id).single().execute()
+            if agent_result.data:
+                agent_has_square = agent_result.data.get('square', False)
+                print(f"Agent has Square enabled: {agent_has_square}")
+        except Exception as e:
+            print(f"Could not check Square status for agent: {e}")
+
+    # Add Square tools if enabled for this agent
+    if agent_has_square:
+        tools.extend([
+            {
+                "type": "function",
+                "name": "get_square_availability",
+                "description": "Check Square booking availability. Use this to see what appointment times are available for scheduling.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "user_id": {
+                            "type": "string",
+                            "description": "The user ID to check availability for (optional, uses agent's owner if not provided)"
+                        },
+                        "days_ahead": {
+                            "type": "integer",
+                            "description": "Number of days ahead to check availability (default: 7)"
+                        },
+                        "location_id": {
+                            "type": "string",
+                            "description": "Optional Square location ID (uses first location if not provided)"
+                        }
+                    },
+                    "required": []
+                }
+            },
+            {
+                "type": "function",
+                "name": "create_square_booking",
+                "description": "Create a booking appointment in Square. Use this to schedule appointments for customers. Always ask for the customer's name before booking.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "booking_time": {
+                            "type": "string",
+                            "description": "The date and time for the booking (e.g., '2024-12-25 14:00' or 'tomorrow at 2pm')"
+                        },
+                        "customer_name": {
+                            "type": "string",
+                            "description": "Customer's full name (e.g., 'John Smith')"
+                        },
+                        "customer_phone": {
+                            "type": "string",
+                            "description": "Optional customer phone number"
+                        },
+                        "customer_email": {
+                            "type": "string",
+                            "description": "Optional customer email address"
+                        },
+                        "customer_note": {
+                            "type": "string",
+                            "description": "Optional note or message from the customer"
+                        },
+                        "location_id": {
+                            "type": "string",
+                            "description": "Optional Square location ID (uses first location if not provided)"
+                        },
+                        "user_id": {
+                            "type": "string",
+                            "description": "The user ID whose Square account to use (optional, uses agent's owner if not provided)"
+                        }
+                    },
+                    "required": ["booking_time", "customer_name"]
+                }
+            }
+        ])
+
+    # Additional tools for specific agent
     if agent_id == "398d539b-cc3b-430c-bbc8-3394d940c03c":
-        tools = [
+        tools.extend([
             {
                 "type": "function",
                 "name": "get_weather",
@@ -1375,7 +1526,7 @@ async def send_session_update(openai_ws, instructions, agent_id=None, welcome_me
                     "required": []
                 }
             }
-        ]
+        ])
 
     session_update = {
         "type": "session.update",
