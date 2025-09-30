@@ -16,3 +16,4 @@ requests==2.31.0
 resend
 langdetect==1.0.9
 numpy==1.26.4
+pydub==0.25.1
