@@ -7,6 +7,7 @@ import contextlib
 import wave
 import io
 import time
+import pytz
 from typing import Any, Dict, Optional
 from fastapi import FastAPI, WebSocket, Request, UploadFile, File, Form, Depends, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -81,6 +82,10 @@ def get_voice_for_text(text: str) -> str:
 # Google OAuth Configuration - YOUR app's credentials
 GOOGLE_CLIENT_ID = os.getenv('GOOGLE_OAUTH_CLIENT_ID')
 GOOGLE_CLIENT_SECRET = os.getenv('GOOGLE_OAUTH_CLIENT_SECRET')
+
+# Square OAuth Configuration
+SQUARE_CLIENT_ID = os.getenv('SQUARE_OAUTH_CLIENT_ID')
+SQUARE_CLIENT_SECRET = os.getenv('SQUARE_OAUTH_CLIENT_SECRET')
 
 # Supabase configuration
 SUPABASE_URL = os.getenv('SUPABASE_URL')
@@ -272,6 +277,377 @@ async def receive_google_oauth(payload: GoogleOAuthPayload):
     return {"ok": True}
 
 app.include_router(google_router)
+
+# Square OAuth credential intake endpoint
+from square_bookings import (
+    SquareOAuthPayload,
+    exchange_authorization_code as square_exchange_code,
+    refresh_access_token as square_refresh_token,
+    get_merchant_info,
+    list_locations
+)
+
+square_router = APIRouter(prefix="/square", tags=["square"])
+
+@square_router.post("/auth")
+async def receive_square_oauth(payload: SquareOAuthPayload):
+    """Accept Square OAuth authorization code or tokens for a user.
+
+    Frontend can send either:
+    - authorization_code: Will be exchanged for tokens
+    - access_token: Direct token (with optional refresh_token)
+    """
+    from datetime import datetime, timezone, timedelta
+
+    # Use app's OAuth credentials from environment
+    client_id = SQUARE_CLIENT_ID or payload.client_id
+    client_secret = SQUARE_CLIENT_SECRET or payload.client_secret
+
+    if not client_id or not client_secret:
+        raise HTTPException(status_code=400, detail="Missing Square OAuth client credentials")
+
+    # Handle authorization code exchange
+    if payload.authorization_code:
+        try:
+            # Exchange authorization code for tokens
+            token_response = square_exchange_code(
+                code=payload.authorization_code,
+                client_id=client_id,
+                client_secret=client_secret,
+                token_uri=payload.token_uri,
+                redirect_uri=payload.redirect_uri
+            )
+
+            # Update payload with received tokens
+            payload.access_token = token_response['access_token']
+            payload.refresh_token = token_response.get('refresh_token')
+            payload.expires_at = token_response.get('expires_at')
+            payload.merchant_id = token_response.get('merchant_id')
+
+            print(f"Successfully exchanged authorization code for tokens")
+            print(f"Got refresh token: {'Yes' if payload.refresh_token else 'No'}")
+            print(f"Merchant ID: {payload.merchant_id}")
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Failed to exchange authorization code: {e}")
+
+    # Ensure we have required credentials
+    if not payload.access_token:
+        raise HTTPException(status_code=400, detail="No access_token or authorization_code provided")
+
+    # Update client credentials
+    payload.client_id = client_id
+    payload.client_secret = client_secret
+
+    # Verify credentials by fetching merchant info
+    try:
+        print("/square/auth: credential payload received")
+
+        merchant_info = get_merchant_info(payload.access_token)
+        merchants = merchant_info.get('merchant', [])
+
+        if merchants:
+            merchant = merchants[0] if isinstance(merchants, list) else merchants
+            payload.merchant_id = merchant.get('id')
+            print(f"Square verification successful for user {payload.user_id}")
+            print(f"Merchant: {merchant.get('business_name', 'N/A')}")
+            print(f"Merchant ID: {payload.merchant_id}")
+
+        # Also fetch locations for display
+        locations_info = list_locations(payload.access_token)
+        locations = locations_info.get('locations', [])
+        print(f"Found {len(locations)} location(s)")
+        for loc in locations:
+            print(f"  - {loc.get('name', 'Unnamed')}: {loc.get('id')}")
+
+    except Exception as e:
+        raise HTTPException(status_code=401, detail=f"Credential verification failed: {e}")
+
+    # Store credentials in Supabase
+    try:
+        # Handle expires_at - could be datetime or string after validation
+        expires_at_dt = None
+        if payload.expires_at:
+            if isinstance(payload.expires_at, datetime):
+                expires_at_dt = payload.expires_at
+            elif isinstance(payload.expires_at, str):
+                # Parse string to datetime for Supabase timestamptz
+                from dateutil.parser import isoparse
+                expires_at_dt = isoparse(payload.expires_at)
+
+        credentials_data = {
+            'user_id': payload.user_id,
+            'access_token': payload.access_token,
+            'refresh_token': payload.refresh_token,
+            'token_uri': payload.token_uri or 'https://connect.squareup.com/oauth2/token',
+            'client_id': client_id,
+            'client_secret': client_secret,
+            'scopes': payload.scopes,
+            'expires_at': expires_at_dt.isoformat() if expires_at_dt else None,
+            'merchant_id': payload.merchant_id
+        }
+
+        # Upsert credentials (insert or update if exists)
+        supabase.table('square_credentials').upsert(
+            credentials_data,
+            on_conflict='user_id'
+        ).execute()
+
+        print(f"✅ Stored Square credentials for user: {payload.user_id}")
+    except Exception as e:
+        print(f"⚠️ Error storing credentials in Supabase: {e}")
+        # Continue even if storage fails - credentials are still valid for this session
+
+    # ===== TEMPORARY TEST CODE =====
+    # Test Square Bookings API - check availability and create appointment
+    print("\n🧪 TESTING SQUARE BOOKINGS API...")
+    try:
+        from square_bookings import get_square_api_base_url, get_square_headers
+        from datetime import datetime, timezone, timedelta
+        import requests
+
+        if locations and len(locations) > 0:
+            test_location_id = locations[0].get('id')
+            print(f"\n📍 Using location: {locations[0].get('name')} (ID: {test_location_id})")
+
+            base_url = get_square_api_base_url(payload.access_token)
+            headers = get_square_headers(payload.access_token)
+
+            # Step 1: Get business booking profile to understand what's available
+            print("\n🏢 Fetching business booking profile...")
+            try:
+                profile_url = f"{base_url}/v2/bookings/business-booking-profile"
+                response = requests.get(profile_url, headers=headers)
+                response.raise_for_status()
+                profile_data = response.json()
+
+                profile = profile_data.get('business_booking_profile', {})
+                print(f"  • Seller ID: {profile.get('seller_id')}")
+                print(f"  • Created: {profile.get('created_at')}")
+                print(f"  • Booking enabled: {profile.get('booking_enabled', False)}")
+                print(f"  • Customer timezone: {profile.get('customer_timezone_choice', 'N/A')}")
+                print(f"  • Booking policy: {profile.get('booking_policy', 'N/A')}")
+
+            except Exception as e:
+                print(f"  ⚠️ Could not fetch business profile: {e}")
+                if hasattr(e, 'response') and hasattr(e.response, 'text'):
+                    print(f"  Response: {e.response.text}")
+
+            # Step 2: Get team member booking profiles
+            print("\n👥 Fetching team member booking profiles...")
+            try:
+                team_profiles_url = f"{base_url}/v2/bookings/team-member-booking-profiles"
+                team_params = {"bookable_only": "true", "location_id": test_location_id}
+                response = requests.get(team_profiles_url, params=team_params, headers=headers)
+                response.raise_for_status()
+                team_profiles_data = response.json()
+
+                team_profiles = team_profiles_data.get('team_member_booking_profiles', [])
+                print(f"  Found {len(team_profiles)} bookable team member(s):")
+
+                selected_team_member_id = None
+                for profile in team_profiles[:3]:
+                    team_member_id = profile.get('team_member_id')
+                    print(f"  • Team Member ID: {team_member_id}")
+                    print(f"    Display name: {profile.get('display_name', 'N/A')}")
+                    print(f"    Bookable: {profile.get('is_bookable', False)}")
+
+                    if profile.get('is_bookable') and not selected_team_member_id:
+                        selected_team_member_id = team_member_id
+
+            except Exception as e:
+                print(f"  ⚠️ Could not fetch team member profiles: {e}")
+                if hasattr(e, 'response') and hasattr(e.response, 'text'):
+                    print(f"  Response: {e.response.text}")
+                selected_team_member_id = None
+
+            # Step 3: Get available services using the auto-fetch function
+            print("\n🔍 Fetching bookable services from catalog...")
+            service_variation_ids = []
+
+            try:
+                from square_bookings import list_catalog_services, get_first_available_service
+
+                services = list_catalog_services(payload.access_token)
+
+                if services:
+                    print(f"  Found {len(services)} service(s):")
+                    for service in services:
+                        service_variation_ids.append(service['id'])
+                        duration_str = f" ({service['duration_ms']}ms)" if service.get('duration_ms') else ""
+                        print(f"  ✓ {service['full_name']}{duration_str}: {service['id']}")
+                else:
+                    print("\n  ⚠️  NO SERVICES FOUND!")
+                    print("  ℹ️   To use Square Bookings, you must create services:")
+                    print("       1. Go to Square Dashboard (https://squareup.com/dashboard)")
+                    print("       2. Navigate to: Appointments > Services")
+                    print("       3. Click 'Create Service' and set up at least one service")
+                    print("       4. Make sure the service is assigned to a team member")
+                    print("\n  Skipping availability check...\n")
+
+            except Exception as e:
+                print(f"  ⚠️ Could not fetch catalog: {e}")
+                if hasattr(e, 'response') and hasattr(e.response, 'text'):
+                    print(f"  Response: {e.response.text}")
+
+            # Step 4: Search for availability over the next 7 days
+            # Only proceed if we have services
+            if not service_variation_ids:
+                print("=" * 60)
+                print("⚠️  Cannot check availability without services configured in Square")
+                print("=" * 60)
+            else:
+                print("\n📅 CHECKING WEEKLY AVAILABILITY...")
+                print("=" * 60)
+
+                now = datetime.now(timezone.utc)
+                days = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
+                thursday_slot = None
+
+                for day_offset in range(7):
+                    target_date = now + timedelta(days=day_offset)
+                    day_name = days[target_date.weekday()]
+
+                    # Search from 9am to 6pm Pacific (convert to UTC for API)
+                    # Pacific time is UTC-7 (PDT) or UTC-8 (PST)
+                    pacific = pytz.timezone('America/Los_Angeles')
+                    target_date_pacific = target_date.astimezone(pacific).replace(hour=0, minute=0, second=0, microsecond=0)
+                    day_start_pacific = target_date_pacific.replace(hour=9, minute=0)
+                    day_end_pacific = target_date_pacific.replace(hour=18, minute=0)  # 6 PM Pacific to catch 5:30 PM slots
+
+                    # Convert back to UTC for the API call
+                    day_start = day_start_pacific.astimezone(timezone.utc)
+                    day_end = day_end_pacific.astimezone(timezone.utc)
+
+                    print(f"\n{day_name}, {target_date.strftime('%B %d, %Y')}:")
+
+                    try:
+                        availability_url = f"{base_url}/v2/bookings/availability/search"
+                        availability_body = {
+                            "query": {
+                                "filter": {
+                                    "location_id": test_location_id,
+                                    "start_at_range": {
+                                        "start_at": day_start.isoformat(),
+                                        "end_at": day_end.isoformat()
+                                    }
+                                }
+                            }
+                        }
+
+                        # Build segment filters - required by Square Bookings API
+                        segment_filter = {
+                            "service_variation_id": service_variation_ids[0]
+                        }
+
+                        if selected_team_member_id:
+                            segment_filter["team_member_id_filter"] = {
+                                "any": [selected_team_member_id]
+                            }
+
+                        availability_body["query"]["filter"]["segment_filters"] = [segment_filter]
+
+                        response = requests.post(availability_url, json=availability_body, headers=headers)
+                        response.raise_for_status()
+                        availability_result = response.json()
+
+                        available_slots = availability_result.get('availabilities', [])
+
+                        if available_slots:
+                            print(f"  ✅ {len(available_slots)} slot(s) available:")
+
+                            pacific = pytz.timezone('America/Los_Angeles')
+
+                            # Display ALL slots and check for Thursday 3pm
+                            for i, slot in enumerate(available_slots):
+                                start_time = slot.get('start_at')
+                                if start_time:
+                                    dt = datetime.fromisoformat(start_time.replace('Z', '+00:00'))
+                                    dt_pacific = dt.astimezone(pacific)
+
+                                    # Display ALL slots
+                                    print(f"     • {dt_pacific.strftime('%I:%M %p')} Pacific ({dt.strftime('%I:%M %p')} UTC)")
+
+                                    # Save Thursday 2pm Pacific slot if available
+                                    if day_name == 'Thursday' and dt_pacific.hour == 14 and not thursday_slot:
+                                        thursday_slot = slot
+                                        print(f"     ⭐ FOUND TARGET SLOT: {dt_pacific.strftime('%I:%M %p')} Pacific")
+                        else:
+                            print(f"  ❌ No slots available")
+
+                    except Exception as e:
+                        print(f"  ⚠️ Error: {e}")
+                        if hasattr(e, 'response') and hasattr(e.response, 'text'):
+                            print(f"  Response: {e.response.text}")
+
+                print("\n" + "=" * 60)
+
+                # Step 5: Create a booking for Thursday at 2pm Pacific if available
+                if thursday_slot:
+                    print(f"\n📝 Creating booking for Thursday at 2:00 PM Pacific...")
+                    start_at = thursday_slot.get('start_at')
+                    print(f"   Time: {start_at}")
+
+                    try:
+                        from square_bookings import create_booking
+                        from datetime import datetime
+
+                        # Parse start_at to datetime
+                        start_at_dt = datetime.fromisoformat(start_at.replace('Z', '+00:00'))
+
+                        # Build appointment segments from the availability slot
+                        appointment_segments = []
+                        if thursday_slot.get('appointment_segments'):
+                            appointment_segments = thursday_slot['appointment_segments']
+
+                        # Create customer info for auto-creation
+                        customer_info = {
+                            'given_name': 'Test',
+                            'family_name': 'Customer',
+                            'email_address': 'test@luron.ai',
+                            'note': 'Auto-created test customer'
+                        }
+
+                        # Use the helper function which will auto-create customer if needed
+                        booking_result = create_booking(
+                            access_token=payload.access_token,
+                            location_id=test_location_id,
+                            start_at=start_at_dt,
+                            customer_note="Test booking via Luron OAuth integration",
+                            seller_note="Automated test - safe to delete",
+                            appointment_segments=appointment_segments,
+                            customer_info=customer_info
+                        )
+
+                        booking = booking_result.get('booking', {})
+                        print(f"\n✅ SUCCESS! Booking created:")
+                        print(f"   📌 Booking ID: {booking.get('id')}")
+                        print(f"   👤 Customer ID: {booking.get('customer_id')}")
+                        print(f"   📅 Start: {booking.get('start_at')}")
+                        print(f"   📊 Status: {booking.get('status')}")
+                        print(f"   🔗 Location: {locations[0].get('name')}")
+
+                    except Exception as e:
+                        print(f"\n❌ Could not create booking: {e}")
+                        if hasattr(e, 'response') and hasattr(e.response, 'text'):
+                            print(f"   Response: {e.response.text}")
+                else:
+                    print("\n⚠️ No Thursday 2pm Pacific slot found - cannot create test booking")
+
+        else:
+            print("⚠️ No locations found")
+
+    except Exception as e:
+        print(f"\n❌ Test failed: {e}")
+        import traceback
+        traceback.print_exc()
+
+    print("\n" + "=" * 60)
+    print("===== END TEST =====\n")
+    # ===== END TEMPORARY TEST CODE =====
+
+    return {"ok": True, "merchant_id": payload.merchant_id}
+
+app.include_router(square_router)
 
 
 async def get_weather():
