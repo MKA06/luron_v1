@@ -631,6 +631,10 @@ async def handle_media_stream_with_agent(websocket: WebSocket, agent_id: str):
         goodbye_audio_bytes: int = 0    # Bytes of goodbye audio sent after end_call
         call_recording_start_time: float = time.time()  # Reference time for recording
 
+        # MEMORY PROTECTION: Detect feedback loops and prevent OOM crashes
+        feedback_detection_window: list[float] = []  # Timestamps of recent cancellations
+        MAX_MEMORY_MB = 100  # Emergency brake - kill connection if exceeded
+
         async def tool_worker():
             nonlocal websocket, should_end_call, goodbye_audio_bytes  # Add needed nonlocals
             while True:
@@ -850,11 +854,21 @@ async def handle_media_stream_with_agent(websocket: WebSocket, agent_id: str):
                         try:
                             decoded = base64.b64decode(data['media']['payload'])
                             ulaw_chunks.append(decoded)
+                            # MEMORY SAFETY: Limit buffer to last 10 minutes (prevents OOM)
+                            # 8kHz * 1 byte * 600 sec = 4.8MB max
+                            max_chunks = 30000  # ~10 min of audio
+                            if len(ulaw_chunks) > max_chunks:
+                                ulaw_chunks = ulaw_chunks[-max_chunks:]
                             # Record user audio with exact timestamp
                             current_timestamp = time.time() - call_recording_start_time
                             call_recorder.append_user_audio(decoded, timestamp=current_timestamp)
                             if is_user_speaking:
                                 current_user_buffer.extend(decoded)
+                                # MEMORY SAFETY: Limit single utterance buffer to 2 minutes
+                                # If someone speaks for 2min straight, truncate oldest audio
+                                max_utterance_size = 960000  # 2 min * 8000 bytes/sec
+                                if len(current_user_buffer) > max_utterance_size:
+                                    current_user_buffer = bytearray(current_user_buffer[-max_utterance_size:])
                         except Exception:
                             pass
                         await openai_ws.send(json.dumps(audio_append))
@@ -997,6 +1011,27 @@ async def handle_media_stream_with_agent(websocket: WebSocket, agent_id: str):
 
                     # Detect function calling and queue tools; also capture assistant text
                     if response.get('type') == 'response.done':
+                        # CRITICAL: Detect feedback loops (rapid cancellations = audio bleeding into input)
+                        response_obj = response.get('response', {})
+                        if response_obj.get('status') == 'cancelled':
+                            cancel_reason = (response_obj.get('status_details') or {}).get('reason')
+                            if cancel_reason == 'turn_detected':
+                                now = time.time()
+                                feedback_detection_window.append(now)
+                                # Keep only last 5 seconds of cancellations
+                                feedback_detection_window[:] = [t for t in feedback_detection_window if now - t < 5.0]
+
+                                # If 8+ cancellations in 5 seconds = feedback loop
+                                if len(feedback_detection_window) >= 8:
+                                    print("❌ FEEDBACK LOOP DETECTED - Terminating connection to prevent OOM")
+                                    print(f"   Detected {len(feedback_detection_window)} cancellations in 5 seconds")
+                                    call_ended_monotonic = time.monotonic()
+                                    with contextlib.suppress(Exception):
+                                        await websocket.close()
+                                    with contextlib.suppress(Exception):
+                                        await openai_ws.close()
+                                    return
+
                         # If we were asked to end the call, wait for the goodbye audio playout time
                         if should_end_call:
                             status = (response.get('response') or {}).get('status')
@@ -1032,6 +1067,9 @@ async def handle_media_stream_with_agent(websocket: WebSocket, agent_id: str):
                                     "role": "assistant",
                                     "text": " ".join(t for t in extracted_texts if t)
                                 })
+                                # MEMORY SAFETY: Keep only last 50 exchanges (100 messages)
+                                if len(conversation) > 100:
+                                    conversation = conversation[-100:]
                             for item in out:
                                 if item.get('type') == 'function_call':
                                     name = item.get('name')

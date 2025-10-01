@@ -41,6 +41,12 @@ class CallRecorder:
             # Append to current segment
             self.current_user_segment[1].extend(pcmu_data)
 
+            # MEMORY SAFETY: Limit current segment to 2 minutes max
+            max_segment_size = 960000  # 2 min at 8kHz
+            if len(self.current_user_segment[1]) > max_segment_size:
+                self.current_user_segment = (self.current_user_segment[0],
+                                             bytearray(self.current_user_segment[1][-max_segment_size:]))
+
     def append_assistant_audio(self, pcmu_data: bytes, timestamp: Optional[float] = None):
         """Append assistant (AI) audio data."""
         if self.is_recording and pcmu_data:
@@ -54,6 +60,12 @@ class CallRecorder:
             # Append to current segment
             self.current_assistant_segment[1].extend(pcmu_data)
 
+            # MEMORY SAFETY: Limit current segment to 2 minutes max
+            max_segment_size = 960000  # 2 min at 8kHz
+            if len(self.current_assistant_segment[1]) > max_segment_size:
+                self.current_assistant_segment = (self.current_assistant_segment[0],
+                                                  bytearray(self.current_assistant_segment[1][-max_segment_size:]))
+
     def user_started_speaking(self, timestamp: Optional[float] = None):
         """Called when user starts speaking (for turn detection)."""
         if timestamp is None:
@@ -64,6 +76,9 @@ class CallRecorder:
             start_time, audio = self.current_user_segment
             if audio:
                 self.user_segments.append((start_time, timestamp, bytes(audio)))
+                # MEMORY SAFETY: Keep only last 200 segments
+                if len(self.user_segments) > 200:
+                    self.user_segments = self.user_segments[-200:]
 
         # Start new user segment
         self.current_user_segment = (timestamp, bytearray())
@@ -75,6 +90,9 @@ class CallRecorder:
                 # Cut off assistant audio at interruption point
                 end_time = timestamp  # Assistant stops when user starts
                 self.assistant_segments.append((start_time, end_time, bytes(audio)))
+                # MEMORY SAFETY: Keep only last 200 segments
+                if len(self.assistant_segments) > 200:
+                    self.assistant_segments = self.assistant_segments[-200:]
                 print(f"Barge-in detected: Assistant segment cut at {end_time:.2f}s")
             self.current_assistant_segment = None
 
@@ -88,6 +106,9 @@ class CallRecorder:
             start_time, audio = self.current_user_segment
             if audio:
                 self.user_segments.append((start_time, timestamp, bytes(audio)))
+                # MEMORY SAFETY: Keep only last 200 segments (prevents feedback loop OOM)
+                if len(self.user_segments) > 200:
+                    self.user_segments = self.user_segments[-200:]
             self.current_user_segment = None
 
     def assistant_started_speaking(self, timestamp: Optional[float] = None):
@@ -101,6 +122,9 @@ class CallRecorder:
             if audio:
                 # Use current timestamp as end time
                 self.assistant_segments.append((start_time, timestamp, bytes(audio)))
+                # MEMORY SAFETY: Keep only last 200 segments
+                if len(self.assistant_segments) > 200:
+                    self.assistant_segments = self.assistant_segments[-200:]
 
         # Start new assistant segment
         self.current_assistant_segment = (timestamp, bytearray())
@@ -115,6 +139,9 @@ class CallRecorder:
             start_time, audio = self.current_assistant_segment
             if audio:
                 self.assistant_segments.append((start_time, timestamp, bytes(audio)))
+                # MEMORY SAFETY: Keep only last 200 segments (prevents feedback loop OOM)
+                if len(self.assistant_segments) > 200:
+                    self.assistant_segments = self.assistant_segments[-200:]
             self.current_assistant_segment = None
 
     def _build_timeline_audio(self) -> Tuple[bytes, bytes]:
