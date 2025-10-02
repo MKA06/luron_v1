@@ -3,6 +3,7 @@ import json
 import base64
 import asyncio
 import re
+import time
 import websockets
 from fastapi import FastAPI, WebSocket, Request
 from fastapi.responses import HTMLResponse, JSONResponse
@@ -64,8 +65,14 @@ async def handle_media_stream(websocket: WebSocket):
     stream_sid = None
     conversation_history = [{"role": "system", "content": SYSTEM_MESSAGE}]
 
+    # Barge-in state management
+    is_ai_speaking = False
+    is_user_speaking = False
+    cancel_ai_response = asyncio.Event()
+    last_ai_audio_time = 0
+
     # Connect to Deepgram STT
-    deepgram_url = f"wss://api.deepgram.com/v1/listen?encoding=mulaw&sample_rate=8000&channels=1&interim_results=true&utterance_end_ms=1000&vad_events=true&endpointing=300"
+    deepgram_url = f"wss://api.deepgram.com/v1/listen?model=nova-3&encoding=mulaw&sample_rate=8000&channels=1&interim_results=true&utterance_end_ms=1000&vad_events=true&endpointing=300"
 
     try:
         async with websockets.connect(
@@ -112,6 +119,7 @@ async def handle_media_stream(websocket: WebSocket):
 
             async def process_deepgram_transcripts():
                 """Receive transcripts from Deepgram and queue them for LLM."""
+                nonlocal is_ai_speaking, is_user_speaking, last_ai_audio_time
                 try:
                     async for message in deepgram_ws:
                         data = json.loads(message)
@@ -123,14 +131,46 @@ async def handle_media_stream(websocket: WebSocket):
                             speech_final = data.get('speech_final', False)
 
                             if transcript:
+                                # User is speaking if we have interim or final transcript
+                                if not is_user_speaking and len(transcript.strip()) > 0:
+                                    is_user_speaking = True
+
+                                    # Check if AI is currently playing audio (within last 2 seconds)
+                                    time_since_last_audio = time.time() - last_ai_audio_time
+
+                                    if is_ai_speaking and time_since_last_audio < 2.0:
+                                        print(f"🔴 BARGE-IN DETECTED: User speaking while AI is playing audio")
+                                        # Clear Twilio's audio buffer
+                                        if stream_sid:
+                                            clear_message = {
+                                                "event": "clear",
+                                                "streamSid": stream_sid
+                                            }
+                                            await websocket.send_json(clear_message)
+
+                                        # Cancel AI response
+                                        cancel_ai_response.set()
+                                        is_ai_speaking = False
+
+                                        # Clear TTS queue
+                                        while not tts_queue.empty():
+                                            try:
+                                                tts_queue.get_nowait()
+                                            except asyncio.QueueEmpty:
+                                                break
+
+                                        print("✅ AI response cancelled, listening to user")
+
                                 print(f"Deepgram transcript (final={is_final}, speech_final={speech_final}): {transcript}")
 
                                 # Only process final utterances
                                 if speech_final and is_final:
                                     await transcript_queue.put(transcript)
+                                    is_user_speaking = False  # User finished speaking
 
                         elif data.get('type') == 'UtteranceEnd':
                             print("Utterance ended")
+                            is_user_speaking = False
 
                 except Exception as e:
                     print(f"Error in process_deepgram_transcripts: {e}")
@@ -143,12 +183,16 @@ async def handle_media_stream(websocket: WebSocket):
                         transcript = await transcript_queue.get()
                         print(f"Processing with GPT-4o: {transcript}")
 
+                        # Clear cancellation flag before starting
+                        cancel_ai_response.clear()
+
                         # Add user message to conversation
                         conversation_history.append({"role": "user", "content": transcript})
 
                         # Stream response from GPT-4o
                         sentence_buffer = ""
                         full_response = ""
+                        was_cancelled = False
 
                         stream = await openai_client.chat.completions.create(
                             model="gpt-4o",
@@ -158,6 +202,12 @@ async def handle_media_stream(websocket: WebSocket):
                         )
 
                         async for chunk in stream:
+                            # Check for cancellation
+                            if cancel_ai_response.is_set():
+                                print("🛑 LLM generation cancelled due to barge-in")
+                                was_cancelled = True
+                                break
+
                             if chunk.choices[0].delta.content:
                                 content = chunk.choices[0].delta.content
                                 sentence_buffer += content
@@ -178,81 +228,136 @@ async def handle_media_stream(websocket: WebSocket):
                                     # Keep the incomplete part
                                     sentence_buffer = sentences[-1]
 
-                        # Send any remaining text
-                        if sentence_buffer.strip():
-                            await tts_queue.put(sentence_buffer.strip())
+                        if not was_cancelled:
+                            # Send any remaining text
+                            if sentence_buffer.strip():
+                                await tts_queue.put(sentence_buffer.strip())
 
-                        # Add complete response to conversation history
-                        conversation_history.append({"role": "assistant", "content": full_response})
+                            # Add complete response to conversation history
+                            if full_response.strip():
+                                conversation_history.append({"role": "assistant", "content": full_response})
 
-                        # Signal end of response
-                        await tts_queue.put(None)
+                            # Signal end of response
+                            await tts_queue.put(None)
 
                     except Exception as e:
                         print(f"Error in process_llm: {e}")
 
             async def process_tts():
                 """Process LLM responses with ElevenLabs TTS and send audio to Twilio."""
-                while True:
-                    try:
-                        text_chunk = await tts_queue.get()
+                # Connect to ElevenLabs WebSocket once and reuse
+                elevenlabs_url = f"wss://api.elevenlabs.io/v1/text-to-speech/{ELEVENLABS_VOICE_ID}/stream-input?model_id=eleven_turbo_v2_5&output_format=ulaw_8000"
 
-                        if text_chunk is None:
-                            # End of response marker
-                            continue
+                try:
+                    async with websockets.connect(elevenlabs_url) as elevenlabs_ws:
+                        print("Connected to ElevenLabs")
 
-                        print(f"Converting to speech: {text_chunk}")
+                        # Send initial configuration message once
+                        await elevenlabs_ws.send(json.dumps({
+                            "text": " ",
+                            "voice_settings": {
+                                "stability": 0.5,
+                                "similarity_boost": 0.75
+                            },
+                            "xi_api_key": ELEVENLABS_API_KEY
+                        }))
 
-                        # Connect to ElevenLabs WebSocket
-                        elevenlabs_url = f"wss://api.elevenlabs.io/v1/text-to-speech/{ELEVENLABS_VOICE_ID}/stream-input?model_id=eleven_turbo_v2_5&output_format=ulaw_8000"
+                        async def send_elevenlabs_keepalive():
+                            """Send periodic keepalive to ElevenLabs to prevent timeout."""
+                            try:
+                                while True:
+                                    await asyncio.sleep(10)  # Send keepalive every 10 seconds
+                                    # Send empty space to keep connection alive
+                                    await elevenlabs_ws.send(json.dumps({
+                                        "text": " "
+                                    }))
+                            except Exception as e:
+                                print(f"Error in ElevenLabs keepalive: {e}")
 
-                        async with websockets.connect(elevenlabs_url) as elevenlabs_ws:
+                        async def send_text_to_elevenlabs():
+                            """Send text chunks to ElevenLabs as they arrive."""
+                            try:
+                                while True:
+                                    text_chunk = await tts_queue.get()
 
-                            # Send initial configuration message with space
-                            await elevenlabs_ws.send(json.dumps({
-                                "text": " ",
-                                "voice_settings": {
-                                    "stability": 0.5,
-                                    "similarity_boost": 0.75
-                                },
-                                "xi_api_key": ELEVENLABS_API_KEY
-                            }))
+                                    if text_chunk is None:
+                                        # End of response marker - flush the stream
+                                        await elevenlabs_ws.send(json.dumps({
+                                            "text": "",
+                                            "flush": True
+                                        }))
+                                        continue
 
-                            # Send text chunk (ensure it ends with space)
-                            text_to_send = text_chunk if text_chunk.endswith(" ") else text_chunk + " "
-                            await elevenlabs_ws.send(json.dumps({
-                                "text": text_to_send,
-                                "try_trigger_generation": True
-                            }))
+                                    # Check if cancelled
+                                    if cancel_ai_response.is_set():
+                                        print("🛑 Skipping text due to barge-in")
+                                        continue
 
-                            # Send EOS marker
-                            await elevenlabs_ws.send(json.dumps({"text": ""}))
+                                    print(f"Converting to speech: {text_chunk}")
 
-                            # Receive and forward audio to Twilio
-                            async for message in elevenlabs_ws:
-                                data = json.loads(message)
+                                    # Send text chunk (ensure it ends with space)
+                                    text_to_send = text_chunk if text_chunk.endswith(" ") else text_chunk + " "
+                                    await elevenlabs_ws.send(json.dumps({
+                                        "text": text_to_send,
+                                        "try_trigger_generation": True
+                                    }))
+                            except Exception as e:
+                                print(f"Error sending to ElevenLabs: {e}")
 
-                                if data.get('audio'):
-                                    # ElevenLabs returns base64 encoded audio
-                                    audio_data = data['audio']
+                        async def receive_audio_from_elevenlabs():
+                            """Receive audio from ElevenLabs and forward to Twilio."""
+                            nonlocal is_ai_speaking, last_ai_audio_time
+                            try:
+                                async for message in elevenlabs_ws:
+                                    data = json.loads(message)
 
-                                    # Send to Twilio
-                                    if stream_sid:
-                                        audio_delta = {
-                                            "event": "media",
-                                            "streamSid": stream_sid,
-                                            "media": {
-                                                "payload": audio_data
+                                    if data.get('audio'):
+                                        # Check if response was cancelled (barge-in)
+                                        if cancel_ai_response.is_set():
+                                            print("🛑 Dropping audio due to barge-in")
+                                            continue
+
+                                        # Mark AI as speaking when first audio arrives
+                                        if not is_ai_speaking:
+                                            is_ai_speaking = True
+                                            print("🎤 AI started speaking")
+
+                                        # Update last audio time
+                                        last_ai_audio_time = time.time()
+
+                                        # ElevenLabs returns base64 encoded audio
+                                        audio_data = data['audio']
+
+                                        # Send to Twilio only if not cancelled
+                                        if stream_sid and not cancel_ai_response.is_set():
+                                            audio_delta = {
+                                                "event": "media",
+                                                "streamSid": stream_sid,
+                                                "media": {
+                                                    "payload": audio_data
+                                                }
                                             }
-                                        }
-                                        await websocket.send_json(audio_delta)
+                                            await websocket.send_json(audio_delta)
 
-                                elif data.get('isFinal'):
-                                    print("TTS complete for this chunk")
-                                    break
+                                    if data.get('isFinal'):
+                                        print("TTS chunk complete")
+                                        # Clear speaking flag after a short delay to account for audio buffer
+                                        await asyncio.sleep(0.3)
+                                        is_ai_speaking = False
+                                        print("✅ AI finished speaking")
+                            except Exception as e:
+                                print(f"Error receiving from ElevenLabs: {e}")
+                                is_ai_speaking = False
 
-                    except Exception as e:
-                        print(f"Error in process_tts: {e}")
+                        # Run send, receive, and keepalive concurrently
+                        await asyncio.gather(
+                            send_elevenlabs_keepalive(),
+                            send_text_to_elevenlabs(),
+                            receive_audio_from_elevenlabs()
+                        )
+
+                except Exception as e:
+                    print(f"Error in process_tts: {e}")
 
             # Run all tasks concurrently
             await asyncio.gather(
