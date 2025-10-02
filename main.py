@@ -544,6 +544,35 @@ async def handle_agent_call(agent_id: str, request: Request):
     agent_welcome = agent_data.get('welcome_message')
     user_id = agent_data.get('user_id')
 
+    # Guardrail: Check if free tier user has exceeded 10 minutes (600 seconds)
+    print(f"🔍 Checking subscription guardrail for user_id: {user_id}")
+    if user_id:
+        try:
+            profile_result = supabase.table('profiles').select('subscription_tier, monthly_duration').eq('user_id', user_id).single().execute()
+            print(f"📊 Profile result: {profile_result.data}")
+            if profile_result.data:
+                subscription_tier = profile_result.data.get('subscription_tier')
+                monthly_duration = profile_result.data.get('monthly_duration', 0)
+
+                print(f"💳 Subscription tier: {subscription_tier}, Monthly duration: {monthly_duration} seconds ({monthly_duration / 60:.2f} minutes)")
+
+                if subscription_tier == 'free' and monthly_duration > 600:
+                    print(f"❌ Call rejected: Free tier user {user_id} has exceeded 10 minutes (current: {monthly_duration / 60:.2f} minutes)")
+                    response = VoiceResponse()
+                    response.say(
+                        "Your free tier minutes have been exceeded. Please upgrade your subscription to continue using this service.",
+                        voice='Google.en-US-Chirp3-HD-Aoede'
+                    )
+                    return HTMLResponse(content=str(response), media_type="application/xml")
+                else:
+                    print(f"✅ Call allowed: tier={subscription_tier}, duration={monthly_duration}s")
+        except Exception as e:
+            print(f"⚠️ Error checking subscription tier: {e}")
+            import traceback
+            traceback.print_exc()
+    else:
+        print(f"⚠️ No user_id found for agent")
+
     form = await request.form()
     call_sid = form.get('CallSid')
     from_number = form.get('From')
