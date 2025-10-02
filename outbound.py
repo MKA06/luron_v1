@@ -16,10 +16,10 @@ from langdetect import detect, LangDetectException
 
 try:
     # Twilio is used for TwiML generation and to initiate the outbound call
-    from twilio.rest import Client
+    from twilio.rest import Client as TwilioClient
     from twilio.twiml.voice_response import VoiceResponse, Connect
 except Exception:
-    Client = None  # type: ignore
+    TwilioClient = None  # type: ignore
     VoiceResponse = None  # type: ignore
     Connect = None  # type: ignore
 
@@ -174,7 +174,7 @@ async def root():
 async def create_outbound_call_with_config(call_request: CallRequest, request: Request):
     if not all([TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_FROM_NUMBER]):
         raise HTTPException(status_code=500, detail="Missing Twilio credentials")
-    if Client is None:
+    if TwilioClient is None:
         raise HTTPException(status_code=500, detail="twilio library not installed")
 
     # Guardrail: Check if user is on free tier
@@ -209,7 +209,7 @@ async def create_outbound_call_with_config(call_request: CallRequest, request: R
     if PUBLIC_BASE_URL:
         twiml_url = f"{PUBLIC_BASE_URL.rstrip('/')}/outbound-twiml?session_id={session_id}"
 
-    client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+    client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
     try:
         call = client.calls.create(
             to=to_number,
@@ -251,7 +251,7 @@ async def create_outbound_call_legacy(number: str, request: Request):
 async def create_batch_outbound_calls(batch_request: BatchCallRequest, request: Request):
     if not all([TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_FROM_NUMBER]):
         raise HTTPException(status_code=500, detail="Missing Twilio credentials")
-    if Client is None:
+    if TwilioClient is None:
         raise HTTPException(status_code=500, detail="twilio library not installed")
 
     # Guardrail: Check if user is on free tier
@@ -275,7 +275,7 @@ async def create_batch_outbound_calls(batch_request: BatchCallRequest, request: 
 
     host = request.url.hostname or request.headers.get("host", "localhost")
 
-    client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+    client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
 
     async def call_single_number(number: str):
         """Helper function to call a single number and return result."""
