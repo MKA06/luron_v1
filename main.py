@@ -133,11 +133,31 @@ if not OPENAI_API_KEY:
 
 # Include outbound call routes if available
 try:
-    from outbound import app as outbound_app
-    # Mount the outbound app at a prefix
-    app.mount("/outbound", outbound_app)
-except ImportError:
-    print("Outbound app not available")
+    from outbound import (
+        create_batch_outbound_calls,
+        BatchCallRequest,
+        outbound_twiml,
+        handle_media_stream
+    )
+
+    @app.post("/batch-call")
+    async def batch_call_endpoint(batch_request: BatchCallRequest, request: Request):
+        """Proxy endpoint for batch calling - delegates to outbound.py logic"""
+        return await create_batch_outbound_calls(batch_request, request)
+
+    @app.api_route("/outbound-twiml", methods=["GET", "POST"])
+    async def outbound_twiml_endpoint(request: Request, session_id: str = None):
+        """Proxy endpoint for outbound TwiML - delegates to outbound.py logic"""
+        return await outbound_twiml(request, session_id)
+
+    @app.websocket("/media-stream/{session_id}")
+    async def outbound_media_stream(websocket: WebSocket, session_id: str):
+        """Proxy endpoint for outbound media stream - delegates to outbound.py logic"""
+        return await handle_media_stream(websocket, session_id)
+
+    print("✅ Outbound endpoints loaded successfully (batch-call, twiml, media-stream)")
+except ImportError as e:
+    print(f"Outbound app not available: {e}")
 except Exception as e:
     print(f"Error loading outbound app: {e}")
 

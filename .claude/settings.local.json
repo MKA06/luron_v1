@@ -8,7 +8,9 @@
       "Bash(python:*)",
       "WebFetch(domain:github.com)",
       "WebFetch(domain:www.assemblyai.com)",
-      "Bash(python3:*)"
+      "Bash(python3:*)",
+      "WebFetch(domain:developers.deepgram.com)",
+      "WebFetch(domain:elevenlabs.io)"
     ],
     "deny": [],
     "ask": []
