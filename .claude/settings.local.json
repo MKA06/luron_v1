@@ -10,7 +10,8 @@
       "WebFetch(domain:www.assemblyai.com)",
       "Bash(python3:*)",
       "WebFetch(domain:developers.deepgram.com)",
-      "WebFetch(domain:elevenlabs.io)"
+      "WebFetch(domain:elevenlabs.io)",
+      "WebFetch(domain:soniox.com)"
     ],
     "deny": [],
     "ask": []

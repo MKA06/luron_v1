@@ -360,7 +360,7 @@ async def outbound_twiml(request: Request, session_id: Optional[str] = None):
     host = request.url.hostname
     connect = Connect()
     # Use path parameter instead of query parameter (Twilio doesn't pass query params to WebSocket)
-    connect.stream(url=f'wss://{host}/media-stream/{session_id}')
+    connect.stream(url=f'wss://{host}/media-stream/outbound/{session_id}')
     response.append(connect)
 
     return HTMLResponse(content=str(response), media_type="application/xml")
@@ -376,7 +376,7 @@ LOG_EVENT_TYPES = [
 ]
 
 
-@app.websocket("/media-stream/{session_id}")
+@app.websocket("/media-stream/outbound/{session_id}")
 async def handle_media_stream(websocket: WebSocket, session_id: str):
     """Handle WebSocket connections between Twilio and OpenAI."""
     print(f"Outbound: Client connected with session_id: {session_id}")

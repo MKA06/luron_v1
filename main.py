@@ -150,7 +150,7 @@ try:
         """Proxy endpoint for outbound TwiML - delegates to outbound.py logic"""
         return await outbound_twiml(request, session_id)
 
-    @app.websocket("/media-stream/{session_id}")
+    @app.websocket("/media-stream/outbound/{session_id}")
     async def outbound_media_stream(websocket: WebSocket, session_id: str):
         """Proxy endpoint for outbound media stream - delegates to outbound.py logic"""
         return await handle_media_stream(websocket, session_id)
