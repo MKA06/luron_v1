@@ -1282,9 +1282,8 @@ async def send_session_update(openai_ws, instructions, agent_id=None, welcome_me
                 }
             }
         ])
-
     # Additional tools for specific agent
-    if agent_id == "398d539b-cc3b-430c-bbc8-3394d940c03c" or "85693041-160f-43f8-ba41-031fe4d843be":
+    if agent_id == "398d539b-cc3b-430c-bbc8-3394d940c03c" or "85693041-160f-43f8-ba41-031fe4d843be" or "255144ce-a6ed-459e-b312-ddf36f1f584e" or "c0a2cb07-f0a2-497e-9e6f-a79c6af6c174":
         tools.extend([
             {
                 "type": "function",
