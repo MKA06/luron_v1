@@ -24,7 +24,7 @@ if not SUPABASE_URL or not SUPABASE_KEY:
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 # Test user ID
-TEST_USER_ID = '827c7c35-4b1e-41c4-85a2-bacbd48d70b1'
+TEST_USER_ID = 'f8505a11-96cb-4e3f-a326-5ab5e511cdb2'
 
 
 async def test_get_availability_all_days():

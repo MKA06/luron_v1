@@ -132,6 +132,7 @@ if not OPENAI_API_KEY:
     raise ValueError('Missing the OpenAI API key. Please set it in the .env file.')
 
 # Include outbound call routes if available
+outbound_available = False
 try:
     from outbound import (
         create_batch_outbound_calls,
@@ -139,11 +140,27 @@ try:
         outbound_twiml,
         handle_media_stream
     )
+    outbound_available = True
+    print("✅ Outbound module imported successfully")
+except ImportError as e:
+    print(f"⚠️ Outbound app not available: {e}")
+    print("   Make sure 'twilio' library is installed: pip install twilio")
+except Exception as e:
+    print(f"❌ Error loading outbound app: {e}")
 
+# Register outbound endpoints
+if outbound_available:
     @app.post("/batch-call")
     async def batch_call_endpoint(batch_request: BatchCallRequest, request: Request):
         """Proxy endpoint for batch calling - delegates to outbound.py logic"""
-        return await create_batch_outbound_calls(batch_request, request)
+        print(f"📞 Batch call request received for {len(batch_request.numbers)} numbers")
+        try:
+            result = await create_batch_outbound_calls(batch_request, request)
+            print(f"✅ Batch call completed successfully")
+            return result
+        except Exception as e:
+            print(f"❌ Batch call error: {e}")
+            raise
 
     @app.api_route("/outbound-twiml", methods=["GET", "POST"])
     async def outbound_twiml_endpoint(request: Request, session_id: str = None):
@@ -155,11 +172,17 @@ try:
         """Proxy endpoint for outbound media stream - delegates to outbound.py logic"""
         return await handle_media_stream(websocket, session_id)
 
-    print("✅ Outbound endpoints loaded successfully (batch-call, twiml, media-stream)")
-except ImportError as e:
-    print(f"Outbound app not available: {e}")
-except Exception as e:
-    print(f"Error loading outbound app: {e}")
+    print("✅ Outbound endpoints registered: /batch-call, /outbound-twiml, /media-stream/outbound")
+else:
+    # Register a stub endpoint that returns a helpful error message
+    @app.post("/batch-call")
+    async def batch_call_unavailable(request: Request):
+        """Stub endpoint when outbound module is not available"""
+        print("❌ /batch-call called but outbound module not available")
+        raise HTTPException(
+            status_code=503,
+            detail="Batch calling is not available. The outbound module failed to load. Please contact support."
+        )
 
 # Google OAuth credential intake endpoint
 

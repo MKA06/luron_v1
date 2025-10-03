@@ -165,17 +165,17 @@ def get_calendar_events(credentials: Credentials,
                         time_max: Optional[datetime] = None,
                         max_results: int = 250,
                         calendar_id: str = 'primary') -> List[Dict]:
-    """Fetch calendar events within a time range.
+    """Fetch calendar events within a time range from ALL calendars.
 
     Args:
         credentials: Google OAuth credentials
         time_min: Start time (defaults to now)
         time_max: End time (defaults to 7 days from now)
-        max_results: Maximum number of events to fetch
-        calendar_id: Calendar ID to fetch from (default 'primary')
+        max_results: Maximum number of events to fetch per calendar
+        calendar_id: If set to 'primary', fetches from all calendars. Otherwise fetches from specific calendar.
 
     Returns:
-        List of calendar events
+        List of calendar events from all calendars
     """
     service = get_calendar_service(credentials)
 
@@ -196,37 +196,91 @@ def get_calendar_events(credentials: Credentials,
     time_max_str = time_max.isoformat()
 
     print(f"Fetching events from {time_min_str} to {time_max_str}")
-    print(f"Calendar ID: {calendar_id}")
+
+    all_events = []
 
     try:
-        # First, let's check if we can access the calendar
-        calendar = service.calendars().get(calendarId=calendar_id).execute()
-        print(f"Calendar timezone: {calendar.get('timeZone', 'Not specified')}")
+        # If calendar_id is 'primary', fetch from ALL calendars
+        if calendar_id == 'primary':
+            # Get all calendars
+            calendar_list = service.calendarList().list().execute()
+            calendars = calendar_list.get('items', [])
+            print(f"Found {len(calendars)} calendars to check")
 
-        events_result = service.events().list(
-            calendarId=calendar_id,
-            timeMin=time_min_str,
-            timeMax=time_max_str,
-            maxResults=max_results,
-            singleEvents=True,
-            orderBy='startTime',
-            showDeleted=False,
-            showHiddenInvitations=False,
-            timeZone='UTC'  # Request events in UTC
-        ).execute()
+            for cal in calendars:
+                cal_id = cal['id']
+                cal_name = cal.get('summary', 'No name')
+                access_role = cal.get('accessRole', 'unknown')
 
-        events = events_result.get('items', [])
-        print(f"Found {len(events)} events")
+                # Skip calendars we can't read from
+                if access_role not in ['owner', 'writer', 'reader']:
+                    continue
+
+                print(f"  Checking calendar: {cal_name} ({cal_id})")
+
+                try:
+                    events_result = service.events().list(
+                        calendarId=cal_id,
+                        timeMin=time_min_str,
+                        timeMax=time_max_str,
+                        maxResults=max_results,
+                        singleEvents=True,
+                        orderBy='startTime',
+                        showDeleted=False,
+                        showHiddenInvitations=False,
+                        timeZone='UTC'
+                    ).execute()
+
+                    events = events_result.get('items', [])
+                    print(f"    Found {len(events)} events in {cal_name}")
+
+                    # Add calendar info to each event for tracking
+                    for event in events:
+                        event['calendar_id'] = cal_id
+                        event['calendar_name'] = cal_name
+
+                    all_events.extend(events)
+
+                except Exception as e:
+                    print(f"    Error fetching events from {cal_name}: {e}")
+                    continue
+
+        else:
+            # Fetch from specific calendar
+            print(f"Calendar ID: {calendar_id}")
+            calendar = service.calendars().get(calendarId=calendar_id).execute()
+            print(f"Calendar timezone: {calendar.get('timeZone', 'Not specified')}")
+
+            events_result = service.events().list(
+                calendarId=calendar_id,
+                timeMin=time_min_str,
+                timeMax=time_max_str,
+                maxResults=max_results,
+                singleEvents=True,
+                orderBy='startTime',
+                showDeleted=False,
+                showHiddenInvitations=False,
+                timeZone='UTC'
+            ).execute()
+
+            all_events = events_result.get('items', [])
+
+        # Sort all events by start time
+        all_events.sort(key=lambda e: e.get('start', {}).get('dateTime', e.get('start', {}).get('date', '')))
+
+        print(f"Total events found across all calendars: {len(all_events)}")
 
         # Debug first few events
-        for i, event in enumerate(events[:3]):
-            print(f"Event {i+1}: {event.get('summary', 'No title')}")
+        for i, event in enumerate(all_events[:5]):
+            cal_name = event.get('calendar_name', 'Unknown')
+            print(f"Event {i+1} ({cal_name}): {event.get('summary', 'No title')}")
             if 'dateTime' in event.get('start', {}):
                 print(f"  Start: {event['start']['dateTime']}")
             elif 'date' in event.get('start', {}):
                 print(f"  All-day: {event['start']['date']}")
 
-        return events
+        return all_events
+
     except Exception as e:
         print(f"Error fetching calendar events: {e}")
         import traceback
@@ -237,7 +291,7 @@ def get_calendar_events(credentials: Credentials,
 def calculate_availability(credentials: Credentials,
                           time_min: Optional[datetime] = None,
                           time_max: Optional[datetime] = None,
-                          business_hours: Tuple[int, int] = (6, 23),
+                          business_hours: Tuple[Tuple[int, int], Tuple[int, int]] = ((8, 30), (14, 0)),
                           user_timezone: str = 'America/New_York') -> Dict:
     """Calculate availability based on calendar events.
 
@@ -245,7 +299,7 @@ def calculate_availability(credentials: Credentials,
         credentials: Google OAuth credentials
         time_min: Start time for availability check
         time_max: End time for availability check
-        business_hours: Tuple of (start_hour, end_hour) in 24h format in user's timezone
+        business_hours: Tuple of ((start_hour, start_minute), (end_hour, end_minute)) in 24h format in user's timezone
         user_timezone: User's timezone for business hours calculation
 
     Returns:
@@ -334,13 +388,16 @@ def calculate_availability(credentials: Credentials,
         # Only check weekdays
         if current_date.weekday() < 5:  # Monday = 0, Sunday = 6
             # Create business hours in user's timezone, then convert to UTC
+            start_hour, start_minute = business_hours[0]
+            end_hour, end_minute = business_hours[1]
+
             day_start_local = user_tz.localize(datetime.combine(
                 current_date,
-                datetime.min.time().replace(hour=business_hours[0], minute=0, second=0, microsecond=0)
+                datetime.min.time().replace(hour=start_hour, minute=start_minute, second=0, microsecond=0)
             ))
             day_end_local = user_tz.localize(datetime.combine(
                 current_date,
-                datetime.min.time().replace(hour=business_hours[1], minute=0, second=0, microsecond=0)
+                datetime.min.time().replace(hour=end_hour, minute=end_minute, second=0, microsecond=0)
             ))
 
             # Convert to UTC for comparison with events
@@ -901,6 +958,8 @@ async def get_availability(supabase, user_id: str = None, days_ahead: int = 60, 
         if target_date:
             busy_periods = [bp for bp in busy_periods
                           if datetime.fromisoformat(bp['start']).astimezone(user_tz).date() == target_date]
+        
+        """
         if busy_periods:
             response += "Busy times:\n"
             for busy in busy_periods[:10]:  # Limit to first 10
@@ -911,7 +970,7 @@ async def get_availability(supabase, user_id: str = None, days_ahead: int = 60, 
                 end_local = end_utc.astimezone(user_tz)
                 response += f"- {start_local.strftime('%a %b %d, %I:%M %p')} to {end_local.strftime('%I:%M %p')}: Busy\n"
             response += "\n"
-
+"""
         # Show available slots
         available_slots = availability.get('available_slots', [])
 
