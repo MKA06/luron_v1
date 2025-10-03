@@ -237,9 +237,8 @@ def get_calendar_events(credentials: Credentials,
 def calculate_availability(credentials: Credentials,
                           time_min: Optional[datetime] = None,
                           time_max: Optional[datetime] = None,
-                          business_hours: Tuple[int, int] = (9, 17),
-                          time_slot_minutes: int = 30,
-                          user_timezone: str = 'America/Los_Angeles') -> Dict:
+                          business_hours: Tuple[int, int] = (6, 23),
+                          user_timezone: str = 'America/New_York') -> Dict:
     """Calculate availability based on calendar events.
 
     Args:
@@ -247,11 +246,10 @@ def calculate_availability(credentials: Credentials,
         time_min: Start time for availability check
         time_max: End time for availability check
         business_hours: Tuple of (start_hour, end_hour) in 24h format in user's timezone
-        time_slot_minutes: Duration of each time slot in minutes
         user_timezone: User's timezone for business hours calculation
 
     Returns:
-        Dictionary containing availability information
+        Dictionary containing availability information with free intervals
     """
     import pytz
 
@@ -272,23 +270,18 @@ def calculate_availability(credentials: Credentials,
     # Get all events in the time range (events come back in UTC)
     events = get_calendar_events(credentials, time_min, time_max)
 
-    print(f"\nCalculating availability in timezone: {user_timezone}")
-    print(f"Business hours: {business_hours[0]}:00 - {business_hours[1]}:00 {user_timezone}")
 
     # Build list of busy periods (all in UTC)
     busy_periods = []
-    print(f"\nProcessing {len(events)} events for availability calculation")
 
     for event in events:
         event_summary = event.get('summary', 'No title')
 
-        # Handle all-day events
         if 'dateTime' in event.get('start', {}):
-            # Parse datetime - handle various ISO formats
+            # Regular timed event
             start_str = event['start']['dateTime']
             end_str = event['end']['dateTime']
 
-            # Parse with proper timezone handling
             try:
                 # Handle Z suffix (UTC)
                 if start_str.endswith('Z'):
@@ -306,13 +299,6 @@ def calculate_availability(credentials: Credentials,
                     end = datetime.fromisoformat(end_str)
                 else:
                     end = datetime.fromisoformat(end_str).replace(tzinfo=timezone.utc)
-
-                # Convert to user's timezone for display
-                start_local = start.astimezone(user_tz)
-                end_local = end.astimezone(user_tz)
-                print(f"  {event_summary}")
-                print(f"    UTC: {start.strftime('%Y-%m-%d %H:%M')} to {end.strftime('%H:%M')}")
-                print(f"    {user_timezone}: {start_local.strftime('%Y-%m-%d %H:%M')} to {end_local.strftime('%H:%M')}")
             except Exception as e:
                 print(f"  Error parsing datetime for '{event_summary}': {e}")
                 continue
@@ -339,18 +325,15 @@ def calculate_availability(credentials: Credentials,
     # Sort busy periods by start time
     busy_periods.sort(key=lambda x: x['start'])
 
-    # Calculate available slots
+    # Calculate available intervals (gaps between busy periods)
     available_slots = []
     current_date = time_min.date()
     end_date = time_max.date()
-
-    print(f"\nFinding available slots from {current_date} to {end_date}")
 
     while current_date <= end_date:
         # Only check weekdays
         if current_date.weekday() < 5:  # Monday = 0, Sunday = 6
             # Create business hours in user's timezone, then convert to UTC
-            # This ensures 9am-5pm PST is correctly represented
             day_start_local = user_tz.localize(datetime.combine(
                 current_date,
                 datetime.min.time().replace(hour=business_hours[0], minute=0, second=0, microsecond=0)
@@ -364,34 +347,51 @@ def calculate_availability(credentials: Credentials,
             day_start_utc = day_start_local.astimezone(pytz.UTC)
             day_end_utc = day_end_local.astimezone(pytz.UTC)
 
-            # Check each potential time slot
-            slot_start = day_start_utc
-            while slot_start + timedelta(minutes=time_slot_minutes) <= day_end_utc:
-                slot_end = slot_start + timedelta(minutes=time_slot_minutes)
+            # Get busy periods for this day only (already sorted from parent list)
+            day_busy = [bp for bp in busy_periods
+                       if not (bp['end'] <= day_start_utc or bp['start'] >= day_end_utc)]
 
-                # Check if slot conflicts with any busy period (all in UTC)
-                is_available = True
-                for busy in busy_periods:
-                    if not (slot_end <= busy['start'] or slot_start >= busy['end']):
-                        is_available = False
-                        break
+            # Merge overlapping busy periods
+            merged_busy = []
+            for busy in day_busy:
+                # Clamp busy period to business hours
+                busy_start = max(busy['start'], day_start_utc)
+                busy_end = min(busy['end'], day_end_utc)
 
-                if is_available and slot_start >= time_min:
-                    # Convert back to local time for storage
-                    slot_start_local = slot_start.astimezone(user_tz)
-                    slot_end_local = slot_end.astimezone(user_tz)
-                    available_slots.append({
-                        'start': slot_start,  # Keep UTC for API
-                        'end': slot_end,
-                        'start_local': slot_start_local,  # Add local for display
-                        'end_local': slot_end_local
-                    })
+                if merged_busy and busy_start <= merged_busy[-1]['end']:
+                    # Overlapping or adjacent - merge
+                    merged_busy[-1]['end'] = max(merged_busy[-1]['end'], busy_end)
+                else:
+                    # Non-overlapping - add new period
+                    merged_busy.append({'start': busy_start, 'end': busy_end})
 
-                slot_start = slot_end
+            # Find gaps between busy periods
+            current_time = day_start_utc
+            for busy in merged_busy:
+                if current_time < busy['start']:
+                    # There's a gap before this busy period
+                    gap_start = max(current_time, time_min)
+                    gap_end = busy['start']
+                    if gap_start < gap_end:
+                        available_slots.append({
+                            'start': gap_start,
+                            'end': gap_end,
+                            'start_local': gap_start.astimezone(user_tz),
+                            'end_local': gap_end.astimezone(user_tz)
+                        })
+                current_time = max(current_time, busy['end'])
+
+            # Check if there's a gap after the last busy period
+            if current_time < day_end_utc and current_time >= time_min:
+                available_slots.append({
+                    'start': current_time,
+                    'end': day_end_utc,
+                    'start_local': current_time.astimezone(user_tz),
+                    'end_local': day_end_utc.astimezone(user_tz)
+                })
 
         current_date += timedelta(days=1)
 
-    print(f"Found {len(available_slots)} available slots")
 
     return {
         'time_range': {
@@ -411,10 +411,10 @@ def calculate_availability(credentials: Credentials,
             {
                 'start': slot['start'].isoformat(),
                 'end': slot['end'].isoformat(),
-                'start_local': slot['start_local'].isoformat() if 'start_local' in slot else slot['start'].isoformat(),
-                'end_local': slot['end_local'].isoformat() if 'end_local' in slot else slot['end'].isoformat()
+                'start_local': slot['start_local'].isoformat(),
+                'end_local': slot['end_local'].isoformat()
             }
-            for slot in available_slots[:20]  # Limit to first 20 slots for readability
+            for slot in available_slots
         ],
         'total_available_slots': len(available_slots)
     }
@@ -554,7 +554,7 @@ def print_availability(credentials: Credentials, days_ahead: int = 7):
 async def set_meeting(supabase, user_id: str = None,
                       meeting_name: str = None,
                       meeting_time: str = None,
-                      duration_minutes: int = 60,
+                      duration_minutes: int = 120,
                       description: str = None,
                       location: str = None):
     """Schedule a meeting in the user's Google Calendar.
@@ -564,7 +564,7 @@ async def set_meeting(supabase, user_id: str = None,
         user_id: The user ID whose calendar to update
         meeting_name: Title/summary of the meeting
         meeting_time: ISO format datetime string or natural language time
-        duration_minutes: Meeting duration in minutes (default 60)
+        duration_minutes: Meeting duration in minutes (default 120)
         description: Optional meeting description
         location: Optional meeting location
 
@@ -649,8 +649,8 @@ async def set_meeting(supabase, user_id: str = None,
 
         creds = build_credentials(payload)
 
-        # Use Pacific Time as default
-        user_timezone_str = 'America/Los_Angeles'
+        # Use New York Time as default
+        user_timezone_str = 'America/New_York'
         print(f"Using timezone: {user_timezone_str}")
         user_tz = pytz.timezone(user_timezone_str)
 
@@ -771,13 +771,14 @@ async def set_meeting(supabase, user_id: str = None,
         return error_msg
 
 
-async def get_availability(supabase, user_id: str = None, days_ahead: int = 7):
+async def get_availability(supabase, user_id: str = None, days_ahead: int = 60, specific_day: Optional[str] = None):
     """Get user's calendar availability for agents to use.
 
     Args:
         supabase: Supabase client instance
         user_id: The user ID to fetch availability for
-        days_ahead: Number of days to check ahead (default 7)
+        days_ahead: Number of days to check ahead (default 60)
+        specific_day: Optional specific day to check (e.g., 'today', 'tomorrow', '2024-12-25', 'Monday')
 
     Returns:
         A formatted string with availability information
@@ -790,7 +791,6 @@ async def get_availability(supabase, user_id: str = None, days_ahead: int = 7):
         # Fetch credentials from Supabase
         result = supabase.table('google_credentials').select('*').eq('user_id', user_id).single().execute()
 
-        print("results: " , result)
         if not result.data:
             return f"No Google Calendar credentials found for user {user_id}. User needs to authenticate first."
 
@@ -851,19 +851,56 @@ async def get_availability(supabase, user_id: str = None, days_ahead: int = 7):
 
         creds = build_credentials(payload)
 
-        # Use Pacific Time as default for now
-        user_timezone = 'America/Los_Angeles'
-        print(f"Calculating availability for timezone: {user_timezone}")
+        # Use New York Time as default
+        user_timezone = 'America/New_York'
         user_tz = pytz.timezone(user_timezone)
 
         # Calculate availability with timezone
         availability = calculate_availability(creds, user_timezone=user_timezone)
 
+        # Parse specific_day if provided
+        target_date = None
+        if specific_day:
+            now_local = datetime.now(user_tz)
+            specific_day_lower = specific_day.lower()
+
+            if specific_day_lower == 'today':
+                target_date = now_local.date()
+            elif specific_day_lower == 'tomorrow':
+                target_date = (now_local + timedelta(days=1)).date()
+            else:
+                # Try to parse as date or day of week
+                try:
+                    # Try ISO format date
+                    target_date = parser.parse(specific_day).date()
+                except:
+                    # Try day of week (e.g., 'Monday', 'Tuesday')
+                    try:
+                        # Find next occurrence of this day
+                        days_of_week = ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday']
+                        if specific_day_lower in days_of_week:
+                            target_weekday = days_of_week.index(specific_day_lower)
+                            current_weekday = now_local.weekday()
+                            days_until = (target_weekday - current_weekday) % 7
+                            if days_until == 0:
+                                days_until = 7  # Next week if today is the same day
+                            target_date = (now_local + timedelta(days=days_until)).date()
+                    except:
+                        pass
+
         # Format response
-        response = f"📅 Calendar Availability for next {days_ahead} days ({user_timezone}):\n\n"
+        if specific_day and target_date:
+            response = f"📅 Calendar Availability for {target_date.strftime('%A, %B %d, %Y')} ({user_timezone}):\n\n"
+        else:
+            response = f"📅 Calendar Availability for next {days_ahead} days ({user_timezone}):\n\n"
 
         # Show busy periods in user's timezone
         busy_periods = availability.get('busy_periods', [])
+
+        # Filter busy periods by specific_day if provided
+        if target_date:
+            busy_periods = [bp for bp in busy_periods
+                          if datetime.fromisoformat(bp['start']).astimezone(user_tz).date() == target_date]
         if busy_periods:
             response += "Busy times:\n"
             for busy in busy_periods[:10]:  # Limit to first 10
@@ -872,25 +909,23 @@ async def get_availability(supabase, user_id: str = None, days_ahead: int = 7):
                 end_utc = datetime.fromisoformat(busy['end'])
                 start_local = start_utc.astimezone(user_tz)
                 end_local = end_utc.astimezone(user_tz)
-                response += f"- {start_local.strftime('%a %b %d, %I:%M %p')} to {end_local.strftime('%I:%M %p')}: {busy.get('summary', 'Busy')}\n"
+                response += f"- {start_local.strftime('%a %b %d, %I:%M %p')} to {end_local.strftime('%I:%M %p')}: Busy\n"
             response += "\n"
 
         # Show available slots
         available_slots = availability.get('available_slots', [])
+
+        # Filter available slots by specific_day if provided
+        if target_date:
+            available_slots = [slot for slot in available_slots
+                             if datetime.fromisoformat(slot['start']).astimezone(user_tz).date() == target_date]
+
         if available_slots:
-            response += f"Available slots (showing first 10 of {availability['total_available_slots']} total):\n"
+            response += "Available slots:\n"
             current_day = None
-            for slot in available_slots[:10]:
-                # Use local times for display
-                if 'start_local' in slot and 'end_local' in slot:
-                    start = datetime.fromisoformat(slot['start_local'])
-                    end = datetime.fromisoformat(slot['end_local'])
-                else:
-                    # Fallback: convert UTC to local
-                    start_utc = datetime.fromisoformat(slot['start'])
-                    end_utc = datetime.fromisoformat(slot['end'])
-                    start = start_utc.astimezone(user_tz)
-                    end = end_utc.astimezone(user_tz)
+            for slot in available_slots:
+                start = datetime.fromisoformat(slot['start_local'])
+                end = datetime.fromisoformat(slot['end_local'])
 
                 day_str = start.strftime('%A, %B %d')
                 if day_str != current_day:
@@ -904,7 +939,10 @@ async def get_availability(supabase, user_id: str = None, days_ahead: int = 7):
         supabase.table('google_credentials').update({
             'last_used_at': datetime.now(timezone.utc).isoformat()
         }).eq('user_id', user_id).execute()
-
+        print("*"*50)
+        print("called for days ahead", days_ahead)
+        print("called for day: ", specific_day)
+        print(response)
         return response
 
     except Exception as e:

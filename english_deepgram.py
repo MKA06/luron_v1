@@ -672,7 +672,8 @@ async def handle_media_stream_with_agent(websocket: WebSocket, agent_id: str):
     tool_queue: "asyncio.Queue[Optional[Dict[str, Any]]]" = asyncio.Queue()
 
     # Connect to Deepgram STT
-    deepgram_url = f"wss://api.deepgram.com/v1/listen?model=nova-3&language=en&encoding=mulaw&sample_rate=8000&channels=1&interim_results=true"
+    # utterance_end_ms: milliseconds of silence before marking utterance as complete
+    deepgram_url = f"wss://api.deepgram.com/v1/listen?model=nova-3&language=en&encoding=mulaw&sample_rate=8000&channels=1&interim_results=true&utterance_end_ms=1200"
 
     try:
         async with websockets.connect(
@@ -1047,7 +1048,7 @@ async def handle_media_stream_with_agent(websocket: WebSocket, agent_id: str):
                     ])
 
                 # Add agent-specific tools (for specific agent ID)
-                if agent_id == "398d539b-cc3b-430c-bbc8-3394d940c03c":
+                if agent_id == "398d539b-cc3b-430c-bbc8-3394d940c03c" or  "85693041-160f-43f8-ba41-031fe4d843be":
                     tools.extend([
                         {
                             "type": "function",

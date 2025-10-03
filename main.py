@@ -431,18 +431,18 @@ async def get_weather():
 async def set_meeting(user_id: Optional[str] = None,
                       meeting_name: Optional[str] = None,
                       meeting_time: Optional[str] = None,
-                      duration_minutes: int = 60,
+                      duration_minutes: int = 120,
                       description: Optional[str] = None,
                       location: Optional[str] = None):
     """Schedule a meeting in the user's Google Calendar.
-    
+
     This is a wrapper function that calls the actual implementation in gcal.py.
-    
+
     Args:
         user_id: The user ID whose calendar to update
         meeting_name: Title/summary of the meeting
         meeting_time: ISO format datetime string or natural language time
-        duration_minutes: Meeting duration in minutes (default 60)
+        duration_minutes: Meeting duration in minutes (default 120)
         description: Optional meeting description
         location: Optional meeting location
 
@@ -470,28 +470,30 @@ async def set_meeting(user_id: Optional[str] = None,
     )
 
 
-async def get_availability(user_id: Optional[str] = None, days_ahead: int = 7):
+async def get_availability(user_id: Optional[str] = None, days_ahead: int = 60, specific_day: Optional[str] = None):
     """Get user's calendar availability for agents to use.
-    
+
     This is a wrapper function that calls the actual implementation in gcal.py.
 
     Args:
         user_id: The user ID to fetch availability for
-        days_ahead: Number of days to check ahead (default 7)
+        days_ahead: Number of days to check ahead (default 60)
+        specific_day: Optional specific day to check (e.g., 'today', 'tomorrow', '2024-12-25', 'Monday')
 
     Returns:
         A formatted string with availability information
     """
     from gcal import get_availability as gcal_get_availability
-    
+
     # Validate required parameters
     if not user_id:
         raise ValueError("user_id is required")
-    
+
     return await gcal_get_availability(
         supabase=supabase,
         user_id=user_id,
-        days_ahead=days_ahead
+        days_ahead=days_ahead,
+        specific_day=specific_day
     )
 
 
@@ -708,13 +710,15 @@ async def handle_media_stream_with_agent(websocket: WebSocket, agent_id: str):
                             if agent_result.data:
                                 user_id = agent_result.data.get('user_id')
 
-                        days_ahead = args.get("days_ahead", 7)
+                        days_ahead = args.get("days_ahead", 60)
+                        specific_day = args.get("specific_day")
                         if not user_id:
                             output_obj = {"error": "user_id is required for availability check"}
                         else:
                             result = await get_availability(
                                 user_id=user_id,
-                                days_ahead=days_ahead
+                                days_ahead=days_ahead,
+                                specific_day=specific_day
                             )
                             output_obj = {"availability": result}
                     elif name == "set_meeting":
@@ -728,7 +732,7 @@ async def handle_media_stream_with_agent(websocket: WebSocket, agent_id: str):
 
                         meeting_name = args.get("meeting_name")
                         meeting_time = args.get("meeting_time")
-                        duration_minutes = args.get("duration_minutes", 60)
+                        duration_minutes = args.get("duration_minutes", 120)
                         description = args.get("description")
                         location = args.get("location")
 
@@ -971,7 +975,7 @@ async def handle_media_stream_with_agent(websocket: WebSocket, agent_id: str):
 
         async def send_to_twilio():
             """Receive events from the OpenAI Realtime API, send audio back to Twilio."""
-            nonlocal stream_sid, is_user_speaking, current_user_buffer, should_end_call, goodbye_audio_bytes, call_ended_monotonic, current_assistant_response_start
+            nonlocal stream_sid, is_user_speaking, current_user_buffer, should_end_call, goodbye_audio_bytes, call_ended_monotonic, current_assistant_response_start, conversation
             try:
                 async for openai_message in openai_ws:
                     response = json.loads(openai_message)
@@ -1280,7 +1284,7 @@ async def send_session_update(openai_ws, instructions, agent_id=None, welcome_me
         ])
 
     # Additional tools for specific agent
-    if agent_id == "398d539b-cc3b-430c-bbc8-3394d940c03c":
+    if agent_id == "398d539b-cc3b-430c-bbc8-3394d940c03c" or "85693041-160f-43f8-ba41-031fe4d843be":
         tools.extend([
             {
                 "type": "function",
@@ -1295,7 +1299,7 @@ async def send_session_update(openai_ws, instructions, agent_id=None, welcome_me
             {
                 "type": "function",
                 "name": "get_availability",
-                "description": "Check the user's calendar availability for scheduling meetings or appointments.",
+                "description": "Check the user's calendar availability for scheduling meetings or appointments. Can check a specific day or range of days.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -1305,12 +1309,16 @@ async def send_session_update(openai_ws, instructions, agent_id=None, welcome_me
                         },
                         "days_ahead": {
                             "type": "integer",
-                            "description": "Number of days ahead to check availability (default: 7)"
+                            "description": "Number of days ahead to check availability (default: 60)"
+                        },
+                        "specific_day": {
+                            "type": "string",
+                            "description": "Optional specific day to check availability for. Can be 'today', 'tomorrow', a date like '2024-12-25', or a day of week like 'Monday'"
                         }
                     },
                     "required": []
                 }
-            },
+            }, 
             {
                 "type": "function",
                 "name": "set_meeting",
@@ -1328,7 +1336,7 @@ async def send_session_update(openai_ws, instructions, agent_id=None, welcome_me
                         },
                         "duration_minutes": {
                             "type": "integer",
-                            "description": "Duration of the meeting in minutes (default: 60)"
+                            "description": "Duration of the meeting in minutes (default: 120)"
                         },
                         "description": {
                             "type": "string",
