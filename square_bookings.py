@@ -176,11 +176,8 @@ def search_availability(access_token: str,
         response = requests.post(url, json=body, headers=headers)
         response.raise_for_status()
         return response.json()
-    except Exception as e:
-        print(f"Error searching availability: {e}")
-        if hasattr(e, 'response') and hasattr(e.response, 'text'):
-            print(f"Response body: {e.response.text}")
-        print(f"Request body: {body}")
+    except Exception:
+        # Silently fail - used for service discovery
         raise
 
 
@@ -610,8 +607,6 @@ async def get_square_availability(supabase, user_id: str, days_ahead: int = 7, l
     Returns:
         A formatted string with availability information
     """
-    print("CALLED THE GET_SQUARE_AVAILABILITY FUNCTION")
-
     if not user_id:
         return "Error: No user_id provided for availability check"
 
@@ -699,8 +694,6 @@ async def get_square_availability(supabase, user_id: str, days_ahead: int = 7, l
         if not location_id:
             return f"Error: Location '{location}' not found. Available locations: {', '.join([loc.get('name', 'Unnamed') for loc in locations])}"
 
-        print(f"Using location: {location_name} (ID: {location_id})")
-
         # Get all services for this location (by testing each service)
         all_services = list_catalog_services(access_token)
         location_services = []
@@ -722,13 +715,11 @@ async def get_square_availability(supabase, user_id: str, days_ahead: int = 7, l
                 # If no error, this service works at this location
                 location_services.append(service)
             except Exception:
-                # Service not available at this location
-                continue
+                # Service not available at this location - suppress error
+                pass
 
         if not location_services:
             return f"Error: No bookable services found for location '{location_name}'. Please create services in your Square Dashboard under Appointments > Services"
-
-        print(f"Found {len(location_services)} service(s) at {location_name}")
 
         # Use first available service for availability search
         service_id = location_services[0]['id']
@@ -791,7 +782,6 @@ async def get_square_availability(supabase, user_id: str, days_ahead: int = 7, l
         availabilities = availability_response.get('availabilities', [])
 
         # CRITICAL: Fetch existing bookings and filter out occupied time slots
-        print(f"Fetching existing bookings for location {location_id}...")
         try:
             # Get all bookings (Square API doesn't support location_id filter in list endpoint)
             all_bookings = []
@@ -807,8 +797,6 @@ async def get_square_availability(supabase, user_id: str, days_ahead: int = 7, l
                 if not cursor:
                     break
 
-            print(f"Found {len(all_bookings)} total bookings across all locations")
-
             # Filter bookings to only those in our time range and at this location
             booked_times = set()
             for booking in all_bookings:
@@ -823,12 +811,8 @@ async def get_square_availability(supabase, user_id: str, days_ahead: int = 7, l
                         # Check if booking is in our time range
                         if start_at_min <= booking_time <= start_at_max:
                             booked_times.add(booking_time.isoformat())
-                            print(f"  Found booking at: {booking_time.astimezone(user_tz).strftime('%A, %B %d at %I:%M %p')}")
-                    except Exception as e:
-                        print(f"  Error parsing booking time: {e}")
+                    except Exception:
                         continue
-
-            print(f"Total booked slots in time range: {len(booked_times)}")
 
             # Filter out booked time slots from availabilities
             filtered_availabilities = []
@@ -837,12 +821,11 @@ async def get_square_availability(supabase, user_id: str, days_ahead: int = 7, l
                 if slot_time.isoformat() not in booked_times:
                     filtered_availabilities.append(slot)
 
-            print(f"Available slots after filtering Square bookings: {len(filtered_availabilities)} (was {len(availabilities)})")
             availabilities = filtered_availabilities
 
-        except Exception as e:
-            print(f"Warning: Could not fetch Square bookings to filter availability: {e}")
+        except Exception:
             # Continue with unfiltered availability if booking fetch fails
+            pass
 
         # Format response - group by day first
         # Group slots by day
@@ -891,6 +874,13 @@ async def get_square_availability(supabase, user_id: str, days_ahead: int = 7, l
         supabase.table('square_credentials').update({
             'last_used_at': datetime.now(timezone.utc).isoformat()
         }).eq('user_id', user_id).execute()
+
+        # Print what the agent sees
+        print("\n" + "*" * 100)
+        print("AGENT TOOL RESPONSE - get_square_availability")
+        print("*" * 100)
+        print(response)
+        print("*" * 100 + "\n")
 
         return response
 
