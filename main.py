@@ -785,7 +785,8 @@ async def handle_media_stream_with_agent(websocket: WebSocket, agent_id: str):
                                 user_id = agent_result.data.get('user_id')
 
                         days_ahead = args.get("days_ahead", 7)
-                        location_id = args.get("location_id")
+                        location = args.get("location")
+                        specific_day = args.get("specific_day")
 
                         if not user_id:
                             output_obj = {"error": "user_id is required for availability check"}
@@ -795,7 +796,8 @@ async def handle_media_stream_with_agent(websocket: WebSocket, agent_id: str):
                                 supabase=supabase,
                                 user_id=user_id,
                                 days_ahead=days_ahead,
-                                location_id=location_id
+                                location=location,
+                                specific_day=specific_day
                             )
                             output_obj = {"availability": result}
                     elif name == "create_square_booking":
@@ -812,7 +814,8 @@ async def handle_media_stream_with_agent(websocket: WebSocket, agent_id: str):
                         customer_phone = args.get("customer_phone")
                         customer_email = args.get("customer_email")
                         customer_note = args.get("customer_note")
-                        location_id = args.get("location_id")
+                        location = args.get("location")
+                        service_id = args.get("service_id")
 
                         # Auto-add caller's phone number if not provided
                         if not customer_phone and db_call_id:
@@ -840,7 +843,8 @@ async def handle_media_stream_with_agent(websocket: WebSocket, agent_id: str):
                                 customer_phone=customer_phone,
                                 customer_email=customer_email,
                                 customer_note=customer_note,
-                                location_id=location_id
+                                location=location,
+                                service_id=service_id
                             )
                             output_obj = {"booking": result}
                     elif name == "end_call":
@@ -1245,30 +1249,34 @@ async def send_session_update(openai_ws, instructions, agent_id=None, welcome_me
             {
                 "type": "function",
                 "name": "get_square_availability",
-                "description": "Check Square booking availability. Use this to see what appointment times are available for scheduling.",
+                "description": "Check Square booking availability for a specific location. ALWAYS ask which location the customer wants (harvard or brookline) before calling this function. The location parameter is REQUIRED.",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "user_id": {
+                        "location": {
                             "type": "string",
-                            "description": "The user ID to check availability for (optional, uses agent's owner if not provided)"
+                            "description": "Location name to check (e.g., 'harvard' or 'brookline'). REQUIRED - must ask customer which location they prefer before calling this function."
+                        },
+                        "specific_day": {
+                            "type": "string",
+                            "description": "Specific day to check availability for (e.g., 'today', 'tomorrow', '2025-10-10', 'Monday'). If not provided, shows availability for multiple days."
                         },
                         "days_ahead": {
                             "type": "integer",
                             "description": "Number of days ahead to check availability (default: 7)"
                         },
-                        "location_id": {
+                        "user_id": {
                             "type": "string",
-                            "description": "Optional Square location ID (uses first location if not provided)"
+                            "description": "The user ID to check availability for (optional, uses agent's owner if not provided)"
                         }
                     },
-                    "required": []
+                    "required": ["location"]
                 }
             },
             {
                 "type": "function",
                 "name": "create_square_booking",
-                "description": "Create a booking appointment in Square. Use this to schedule appointments for customers. Always ask for the customer's name before booking.",
+                "description": "Create a booking appointment in Square. REQUIRED: Ask for location (harvard or brookline), service type, customer name, and time before booking. Use get_square_availability first to show available services for the location.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -1292,16 +1300,20 @@ async def send_session_update(openai_ws, instructions, agent_id=None, welcome_me
                             "type": "string",
                             "description": "Optional note or message from the customer"
                         },
-                        "location_id": {
+                        "location": {
                             "type": "string",
-                            "description": "Optional Square location ID (uses first location if not provided)"
+                            "description": "Location name (e.g., 'harvard' or 'brookline'). REQUIRED - must ask customer which location they prefer."
+                        },
+                        "service_id": {
+                            "type": "string",
+                            "description": "Service variation ID from the availability response. Use the Service ID shown in get_square_availability. REQUIRED - must ask customer which service they want."
                         },
                         "user_id": {
                             "type": "string",
                             "description": "The user ID whose Square account to use (optional, uses agent's owner if not provided)"
                         }
                     },
-                    "required": ["booking_time", "customer_name"]
+                    "required": ["booking_time", "customer_name", "location"]
                 }
             }
         ])

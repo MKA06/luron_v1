@@ -597,14 +597,15 @@ def get_first_available_service(access_token: str) -> Optional[str]:
         return None
 
 
-async def get_square_availability(supabase, user_id: str, days_ahead: int = 7, location_id: Optional[str] = None):
+async def get_square_availability(supabase, user_id: str, days_ahead: int = 7, location: Optional[str] = None, specific_day: Optional[str] = None):
     """Get Square booking availability for agents to use.
 
     Args:
         supabase: Supabase client instance
         user_id: The user ID to fetch availability for
         days_ahead: Number of days to check ahead (default 7)
-        location_id: Optional specific location ID (uses first location if not provided)
+        location: Optional location name (e.g., 'harvard', 'brookline') - if not provided, lists all locations
+        specific_day: Optional specific day to check (e.g., 'today', 'tomorrow', '2025-10-10', 'Monday')
 
     Returns:
         A formatted string with availability information
@@ -663,28 +664,121 @@ async def get_square_availability(supabase, user_id: str, days_ahead: int = 7, l
 
         access_token = creds_data['access_token']
 
-        # Get location if not provided
-        if not location_id:
-            locations_response = list_locations(access_token)
-            locations = locations_response.get('locations', [])
-            if not locations:
-                return "Error: No Square locations found for this merchant"
-            location_id = locations[0]['id']
-            print(f"Using location: {locations[0].get('name', location_id)}")
+        # Get all locations
+        locations_response = list_locations(access_token)
+        locations = locations_response.get('locations', [])
+        if not locations:
+            return "Error: No Square locations found for this merchant"
 
-        # Get first available service for availability search
-        service_id = get_first_available_service(access_token)
-        if not service_id:
-            return "Error: No bookable services found. Please create services in your Square Dashboard under Appointments > Services"
+        # If no location specified, return list of locations
+        if not location:
+            response = "📍 Available Locations:\n\n"
+            for i, loc in enumerate(locations, 1):
+                loc_name = loc.get('name', 'Unnamed')
+                loc_address = loc.get('address', {})
+                address_line = loc_address.get('address_line_1', '')
+                city = loc_address.get('locality', '')
+                response += f"{i}. {loc_name}\n"
+                if address_line or city:
+                    response += f"   Address: {address_line}, {city}\n"
+                response += "\n"
+            response += "Please specify which location you'd like to check availability for (e.g., 'harvard' or 'brookline')."
+            return response
+
+        # Find location by matching name (case-insensitive partial match)
+        location_id = None
+        location_name = None
+        location_lower = location.lower()
+        for loc in locations:
+            loc_name = loc.get('name', '')
+            if location_lower in loc_name.lower():
+                location_id = loc['id']
+                location_name = loc_name
+                break
+
+        if not location_id:
+            return f"Error: Location '{location}' not found. Available locations: {', '.join([loc.get('name', 'Unnamed') for loc in locations])}"
+
+        print(f"Using location: {location_name} (ID: {location_id})")
+
+        # Get all services for this location (by testing each service)
+        all_services = list_catalog_services(access_token)
+        location_services = []
+
+        # Test each service at this location to see which ones work
+        test_start = datetime.now(timezone.utc)
+        test_end = test_start + timedelta(hours=1)
+
+        for service in all_services:
+            try:
+                segment_filter = {"service_variation_id": service['id']}
+                test_response = search_availability(
+                    access_token=access_token,
+                    location_id=location_id,
+                    start_at_min=test_start,
+                    start_at_max=test_end,
+                    segment_filters=segment_filter
+                )
+                # If no error, this service works at this location
+                location_services.append(service)
+            except Exception:
+                # Service not available at this location
+                continue
+
+        if not location_services:
+            return f"Error: No bookable services found for location '{location_name}'. Please create services in your Square Dashboard under Appointments > Services"
+
+        print(f"Found {len(location_services)} service(s) at {location_name}")
+
+        # Use first available service for availability search
+        service_id = location_services[0]['id']
 
         # Build segment filter for the service
         segment_filter = {
             "service_variation_id": service_id
         }
 
-        # Search availability
+        # Use New York Time as default
+        user_timezone = 'America/New_York'
+        user_tz = pytz.timezone(user_timezone)
+
+        # Parse specific_day if provided
         start_at_min = datetime.now(timezone.utc)
-        start_at_max = start_at_min + timedelta(days=days_ahead)
+        if specific_day:
+            now_local = datetime.now(user_tz)
+            specific_day_lower = specific_day.lower()
+
+            if specific_day_lower == 'today':
+                target_date = now_local.date()
+            elif specific_day_lower == 'tomorrow':
+                target_date = (now_local + timedelta(days=1)).date()
+            else:
+                # Try to parse as date or day of week
+                try:
+                    # Try ISO format date
+                    target_date = parser.parse(specific_day).date()
+                except:
+                    # Try day of week (e.g., 'Monday', 'Tuesday')
+                    try:
+                        days_of_week = ['monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday']
+                        if specific_day_lower in days_of_week:
+                            target_weekday = days_of_week.index(specific_day_lower)
+                            current_weekday = now_local.weekday()
+                            days_until = (target_weekday - current_weekday) % 7
+                            if days_until == 0:
+                                days_until = 7  # Next week if today is the same day
+                            target_date = (now_local + timedelta(days=days_until)).date()
+                        else:
+                            return f"Error: Could not parse specific_day '{specific_day}'. Use 'today', 'tomorrow', a date like '2025-10-10', or a day like 'Monday'."
+                    except:
+                        return f"Error: Could not parse specific_day '{specific_day}'. Use 'today', 'tomorrow', a date like '2025-10-10', or a day like 'Monday'."
+
+            # Set start and end times to cover the target date
+            start_at_min = user_tz.localize(datetime.combine(target_date, datetime.min.time())).astimezone(pytz.UTC)
+            start_at_max = start_at_min + timedelta(days=1)
+        else:
+            # No specific day, check days_ahead
+            start_at_max = start_at_min + timedelta(days=days_ahead)
 
         availability_response = search_availability(
             access_token=access_token,
@@ -696,11 +790,147 @@ async def get_square_availability(supabase, user_id: str, days_ahead: int = 7, l
 
         availabilities = availability_response.get('availabilities', [])
 
-        # Format response - group by day first
-        # Use Boston/Eastern timezone
-        user_timezone = 'America/New_York'
-        user_tz = pytz.timezone(user_timezone)
+        # CRITICAL: Fetch existing bookings and filter out occupied time slots
+        print(f"Fetching existing bookings for location {location_id}...")
+        try:
+            # Get all bookings (Square API doesn't support location_id filter in list endpoint)
+            all_bookings = []
+            cursor = None
+            max_pages = 10  # Safety limit
 
+            for _ in range(max_pages):
+                bookings_response = list_bookings(access_token, limit=100, cursor=cursor)
+                bookings = bookings_response.get('bookings', [])
+                all_bookings.extend(bookings)
+
+                cursor = bookings_response.get('cursor')
+                if not cursor:
+                    break
+
+            print(f"Found {len(all_bookings)} total bookings across all locations")
+
+            # Filter bookings to only those in our time range and at this location
+            booked_times = set()
+            for booking in all_bookings:
+                booking_location = booking.get('location_id')
+                booking_start = booking.get('start_at')
+                booking_status = booking.get('status', '')
+
+                # Only consider active bookings (not cancelled)
+                if booking_location == location_id and booking_start and booking_status in ['PENDING', 'ACCEPTED']:
+                    try:
+                        booking_time = datetime.fromisoformat(booking_start.replace('Z', '+00:00'))
+                        # Check if booking is in our time range
+                        if start_at_min <= booking_time <= start_at_max:
+                            booked_times.add(booking_time.isoformat())
+                            print(f"  Found booking at: {booking_time.astimezone(user_tz).strftime('%A, %B %d at %I:%M %p')}")
+                    except Exception as e:
+                        print(f"  Error parsing booking time: {e}")
+                        continue
+
+            print(f"Total booked slots in time range: {len(booked_times)}")
+
+            # Filter out booked time slots from availabilities
+            filtered_availabilities = []
+            for slot in availabilities:
+                slot_time = datetime.fromisoformat(slot['start_at'].replace('Z', '+00:00'))
+                if slot_time.isoformat() not in booked_times:
+                    filtered_availabilities.append(slot)
+
+            print(f"Available slots after filtering Square bookings: {len(filtered_availabilities)} (was {len(availabilities)})")
+            availabilities = filtered_availabilities
+
+        except Exception as e:
+            print(f"Warning: Could not fetch Square bookings to filter availability: {e}")
+            # Continue with unfiltered availability if booking fetch fails
+
+        # ALSO CRITICAL: Fetch Google Calendar events and filter those out
+        print(f"Fetching Google Calendar events...")
+        try:
+            # Check if user has Google Calendar credentials
+            gcal_result = supabase.table('google_credentials').select('*').eq('user_id', user_id).single().execute()
+
+            if gcal_result.data:
+                print(f"Found Google Calendar credentials, checking for conflicts...")
+
+                # Import gcal functions
+                from gcal import build_credentials, GoogleOAuthPayload
+                from googleapiclient.discovery import build
+
+                creds_data = gcal_result.data
+
+                # Build credentials
+                expiry = None
+                if creds_data.get('expiry'):
+                    expiry = datetime.fromisoformat(creds_data['expiry'].replace('Z', '+00:00'))
+
+                payload = GoogleOAuthPayload(
+                    user_id=creds_data['user_id'],
+                    access_token=creds_data['access_token'],
+                    refresh_token=creds_data.get('refresh_token'),
+                    token_uri=creds_data.get('token_uri', 'https://oauth2.googleapis.com/token'),
+                    client_id=creds_data.get('client_id'),
+                    client_secret=creds_data.get('client_secret'),
+                    scopes=creds_data.get('scopes'),
+                    expiry=expiry
+                )
+
+                creds = build_credentials(payload)
+                service = build('calendar', 'v3', credentials=creds)
+
+                # Fetch events from Google Calendar in the time range
+                events_result = service.events().list(
+                    calendarId='primary',
+                    timeMin=start_at_min.isoformat(),
+                    timeMax=start_at_max.isoformat(),
+                    singleEvents=True,
+                    orderBy='startTime'
+                ).execute()
+
+                gcal_events = events_result.get('items', [])
+                print(f"  Found {len(gcal_events)} Google Calendar events in time range")
+
+                # Extract booked times from Google Calendar
+                gcal_booked_times = set()
+                for event in gcal_events:
+                    event_start = event.get('start', {}).get('dateTime')
+                    if event_start:
+                        try:
+                            event_time = datetime.fromisoformat(event_start.replace('Z', '+00:00'))
+                            # Round to nearest 30-minute slot to match Square's slot granularity
+                            minutes = event_time.minute
+                            if minutes < 15:
+                                rounded = event_time.replace(minute=0, second=0, microsecond=0)
+                            elif minutes < 45:
+                                rounded = event_time.replace(minute=30, second=0, microsecond=0)
+                            else:
+                                rounded = (event_time.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1))
+
+                            gcal_booked_times.add(rounded.isoformat())
+                            print(f"    GCal event at: {event_time.astimezone(user_tz).strftime('%A, %B %d at %I:%M %p')} (blocks {rounded.astimezone(user_tz).strftime('%I:%M %p')} slot)")
+                        except Exception as e:
+                            print(f"    Error parsing GCal event time: {e}")
+                            continue
+
+                # Filter out Google Calendar booked slots
+                filtered_by_gcal = []
+                for slot in availabilities:
+                    slot_time = datetime.fromisoformat(slot['start_at'].replace('Z', '+00:00'))
+                    if slot_time.isoformat() not in gcal_booked_times:
+                        filtered_by_gcal.append(slot)
+
+                print(f"Available slots after filtering Google Calendar: {len(filtered_by_gcal)} (was {len(availabilities)})")
+                availabilities = filtered_by_gcal
+            else:
+                print(f"No Google Calendar credentials found, skipping GCal filtering")
+
+        except Exception as e:
+            print(f"Warning: Could not fetch Google Calendar events: {e}")
+            import traceback
+            traceback.print_exc()
+            # Continue with Square-filtered availability if GCal fetch fails
+
+        # Format response - group by day first
         # Group slots by day
         from collections import defaultdict
         slots_by_day = defaultdict(list)
@@ -712,18 +942,31 @@ async def get_square_availability(supabase, user_id: str, days_ahead: int = 7, l
             time_str = start_local.strftime('%I:%M %p')
             slots_by_day[day_key].append(time_str)
 
-        # Build response with clear day headers
-        response = f"Available appointment times for the next {days_ahead} days:\n\n"
+        # Build response with clear headers
+        if specific_day:
+            response = f"📅 Availability for {location_name} on {specific_day}:\n\n"
+        else:
+            response = f"📅 Availability for {location_name} (next {days_ahead} days):\n\n"
+
+        # List available services at this location
+        response += f"🛠️  Available Services at {location_name}:\n"
+        for i, svc in enumerate(location_services, 1):
+            duration_min = svc.get('duration_ms', 0) // 60000 if svc.get('duration_ms') else 'N/A'
+            response += f"  {i}. {svc['full_name']}"
+            if duration_min != 'N/A':
+                response += f" ({duration_min} min)"
+            response += f"\n     Service ID: {svc['id']}\n"
+        response += "\n"
 
         if slots_by_day:
-            response += f"Total: {len(availabilities)} available slots across {len(slots_by_day)} days\n\n"
+            response += f"📍 Total: {len(availabilities)} available slots\n\n"
 
             # Sort by date and display
             sorted_days = sorted(slots_by_day.keys(), key=lambda x: datetime.strptime(x, '%A, %B %d, %Y'))
 
             for day in sorted_days:
                 times = slots_by_day[day]
-                response += f"**{day}** ({len(times)} slots):\n"
+                response += f"{day} ({len(times)} slots):\n"
                 for time in times:
                     response += f"  • {time}\n"
                 response += "\n"
@@ -811,7 +1054,8 @@ async def create_square_booking(supabase, user_id: str, booking_time: str,
                                customer_phone: Optional[str] = None,
                                customer_email: Optional[str] = None,
                                customer_note: Optional[str] = None,
-                               location_id: Optional[str] = None):
+                               location: Optional[str] = None,
+                               service_id: Optional[str] = None):
     """Create a Square booking for agents to use.
 
     Args:
@@ -822,7 +1066,8 @@ async def create_square_booking(supabase, user_id: str, booking_time: str,
         customer_phone: Optional customer phone number
         customer_email: Optional customer email address
         customer_note: Optional note for the booking
-        location_id: Optional specific location ID
+        location: Optional location name (e.g., 'harvard', 'brookline') - if not provided, uses first location
+        service_id: Optional specific service ID to book - if not provided, uses first available service
 
     Returns:
         A formatted string with booking creation status
@@ -845,18 +1090,74 @@ async def create_square_booking(supabase, user_id: str, booking_time: str,
         creds_data = result.data
         access_token = creds_data['access_token']
 
-        # Get location if not provided
-        if not location_id:
-            locations_response = list_locations(access_token)
-            locations = locations_response.get('locations', [])
-            if not locations:
-                return "Error: No Square locations found"
-            location_id = locations[0]['id']
+        # Get all locations
+        locations_response = list_locations(access_token)
+        locations = locations_response.get('locations', [])
+        if not locations:
+            return "Error: No Square locations found"
 
-        # Get first available service
-        service_id = get_first_available_service(access_token)
+        # Find location by name if provided
+        location_id = None
+        location_name = None
+        if location:
+            location_lower = location.lower()
+            for loc in locations:
+                loc_name = loc.get('name', '')
+                if location_lower in loc_name.lower():
+                    location_id = loc['id']
+                    location_name = loc_name
+                    break
+            if not location_id:
+                return f"Error: Location '{location}' not found. Available locations: {', '.join([loc.get('name', 'Unnamed') for loc in locations])}"
+        else:
+            # Use first location
+            location_id = locations[0]['id']
+            location_name = locations[0].get('name', location_id)
+
+        print(f"Using location: {location_name} (ID: {location_id})")
+
+        # Get service - if not provided, get first available service for this location
         if not service_id:
-            return "Error: No bookable services found. Please create services in your Square Dashboard under Appointments > Services"
+            # Get all services and test at this location
+            all_services = list_catalog_services(access_token)
+            location_services = []
+
+            test_start = datetime.now(timezone.utc)
+            test_end = test_start + timedelta(hours=1)
+
+            for service in all_services:
+                try:
+                    segment_filter = {"service_variation_id": service['id']}
+                    test_response = search_availability(
+                        access_token=access_token,
+                        location_id=location_id,
+                        start_at_min=test_start,
+                        start_at_max=test_end,
+                        segment_filters=segment_filter
+                    )
+                    location_services.append(service)
+                except Exception:
+                    continue
+
+            if not location_services:
+                return f"Error: No bookable services found at location '{location_name}'. Please create services in your Square Dashboard."
+
+            service_id = location_services[0]['id']
+            service_name = location_services[0]['full_name']
+            print(f"Using service: {service_name} (ID: {service_id})")
+        else:
+            # Verify the service exists
+            try:
+                all_services = list_catalog_services(access_token)
+                service_info = next((s for s in all_services if s['id'] == service_id), None)
+                if service_info:
+                    service_name = service_info['full_name']
+                    print(f"Using specified service: {service_name} (ID: {service_id})")
+                else:
+                    return f"Error: Service ID '{service_id}' not found in catalog."
+            except Exception as e:
+                print(f"Warning: Could not verify service: {e}")
+                service_name = "Unknown Service"
 
         # Parse booking time using improved natural language parser
         # Use Boston/Eastern timezone
@@ -961,6 +1262,8 @@ async def create_square_booking(supabase, user_id: str, booking_time: str,
         response = f"✅ Square booking created successfully!\n\n"
         if customer_name:
             response += f"👤 Customer: {customer_name}\n"
+        response += f"📍 Location: {location_name}\n"
+        response += f"🛠️  Service: {service_name}\n"
         response += f"🕐 Time: {parsed_time.strftime('%A, %B %d at %I:%M %p')}\n"
         response += f"🆔 Booking ID: {booking.get('id', 'N/A')}\n"
         if customer_note:
